@@ -82,7 +82,7 @@ export function CameraSelectBase(props: {
 
 	const openCameraWindow = async (e: MouseEvent) => {
 		e.stopPropagation();
-		await commands.showWindow("Camera");
+		await commands.showWindow({ Camera: { centered: false } });
 		await refreshCameraWindowState();
 	};
 

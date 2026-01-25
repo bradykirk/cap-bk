@@ -358,7 +358,7 @@ function InProgressRecordingInner() {
 				const cameraWindow = await WebviewWindow.getByLabel("camera");
 				if (cameraWindow) await cameraWindow.close();
 			} else {
-				await commands.showWindow("Camera");
+				await commands.showWindow({ Camera: { centered: false } });
 			}
 			await refreshCameraWindowState();
 		},

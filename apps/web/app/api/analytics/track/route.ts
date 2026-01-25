@@ -47,10 +47,18 @@ export async function POST(request: NextRequest) {
 	const timestamp = body.occurredAt ? new Date(body.occurredAt) : new Date();
 
 	const country =
-		sanitizeString(request.headers.get("x-vercel-ip-country")) || "";
+		sanitizeString(request.headers.get("x-vercel-ip-country")) ||
+		sanitizeString(request.headers.get("cf-ipcountry")) ||
+		sanitizeString(request.headers.get("x-geo-country")) ||
+		"";
 	const region =
-		sanitizeString(request.headers.get("x-vercel-ip-country-region")) || "";
-	const city = sanitizeString(request.headers.get("x-vercel-ip-city")) || "";
+		sanitizeString(request.headers.get("x-vercel-ip-country-region")) ||
+		sanitizeString(request.headers.get("x-geo-region")) ||
+		"";
+	const city =
+		sanitizeString(request.headers.get("x-vercel-ip-city")) ||
+		sanitizeString(request.headers.get("x-geo-city")) ||
+		"";
 
 	const hostname =
 		sanitizeString(body.hostname) ||

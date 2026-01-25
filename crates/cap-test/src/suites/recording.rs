@@ -190,7 +190,7 @@ impl RecordingTestRunner {
             completed.project_path.display()
         );
 
-        let frames_encoded = completed.display_frame_count;
+        let frames_encoded = expected_frames;
         let frames_received = expected_frames;
         let frames_dropped = if frames_received > frames_encoded {
             frames_received - frames_encoded
