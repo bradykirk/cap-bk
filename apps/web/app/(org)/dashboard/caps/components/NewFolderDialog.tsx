@@ -12,7 +12,6 @@ import {
 import type { Folder, Space } from "@cap/web-domain";
 import { faFolderPlus } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
-import { type RiveFile, useRiveFile } from "@rive-app/react-canvas";
 import clsx from "clsx";
 import { Option } from "effect";
 import { useRouter } from "next/navigation";
@@ -37,34 +36,22 @@ const FolderOptions = [
 	{
 		value: "normal",
 		label: "Normal",
-		component: (
-			riveFile: RiveFile | undefined,
-			ref: React.Ref<FolderHandle>,
-		) => <NormalFolder riveFile={riveFile} ref={ref} />,
+		component: (ref: React.Ref<FolderHandle>) => <NormalFolder ref={ref} />,
 	},
 	{
 		value: "blue",
 		label: "Blue",
-		component: (
-			riveFile: RiveFile | undefined,
-			ref: React.Ref<FolderHandle>,
-		) => <BlueFolder riveFile={riveFile} ref={ref} />,
+		component: (ref: React.Ref<FolderHandle>) => <BlueFolder ref={ref} />,
 	},
 	{
 		value: "red",
 		label: "Red",
-		component: (
-			riveFile: RiveFile | undefined,
-			ref: React.Ref<FolderHandle>,
-		) => <RedFolder riveFile={riveFile} ref={ref} />,
+		component: (ref: React.Ref<FolderHandle>) => <RedFolder ref={ref} />,
 	},
 	{
 		value: "yellow",
 		label: "Yellow",
-		component: (
-			riveFile: RiveFile | undefined,
-			ref: React.Ref<FolderHandle>,
-		) => <YellowFolder riveFile={riveFile} ref={ref} />,
+		component: (ref: React.Ref<FolderHandle>) => <YellowFolder ref={ref} />,
 	},
 ] as const;
 
@@ -78,10 +65,6 @@ export const NewFolderDialog: React.FC<Props> = ({
 	>(null);
 	const [folderName, setFolderName] = useState<string>("");
 	const router = useRouter();
-
-	const { riveFile } = useRiveFile({
-		src: "/rive/dashboard.riv",
-	});
 
 	useEffect(() => {
 		if (!open) setSelectedColor(null);
@@ -168,10 +151,7 @@ export const NewFolderDialog: React.FC<Props> = ({
 										folderRef.play("folder-close");
 									}}
 								>
-									{option.component(
-										riveFile as RiveFile,
-										folderRefs.current[option.value],
-									)}
+									{option.component(folderRefs.current[option.value])}
 									<p className="text-xs text-gray-10">{option.label}</p>
 								</div>
 							);
