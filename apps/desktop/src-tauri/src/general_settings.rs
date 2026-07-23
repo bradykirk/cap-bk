@@ -1,3 +1,4 @@
+use crate::updates::UpdateChannel;
 use crate::window_exclusion::WindowExclusion;
 use scap_targets::DisplayId;
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use specta::Type;
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use tauri::Listener;
-use tauri::{AppHandle, Wry};
+use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_store::StoreExt;
 use tracing::{error, instrument};
 use uuid::Uuid;
@@ -58,44 +59,58 @@ impl Default for StudioRecordingQuality {
     }
 }
 
-fn detect_total_memory_bytes() -> Option<u64> {
-    let system = sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing()
-            .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
-    );
-    Some(system.total_memory()).filter(|m| *m > 0)
+impl From<cap_recording::StudioQuality> for StudioRecordingQuality {
+    fn from(value: cap_recording::StudioQuality) -> Self {
+        match value {
+            cap_recording::StudioQuality::Compatibility => Self::Compatibility,
+            cap_recording::StudioQuality::Balanced => Self::Balanced,
+            cap_recording::StudioQuality::Ultra => Self::Ultra,
+        }
+    }
 }
 
-const COMPATIBILITY_MEMORY_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+impl From<StudioRecordingQuality> for cap_recording::StudioQuality {
+    fn from(value: StudioRecordingQuality) -> Self {
+        match value {
+            StudioRecordingQuality::Compatibility => Self::Compatibility,
+            StudioRecordingQuality::Balanced => Self::Balanced,
+            StudioRecordingQuality::Ultra => Self::Ultra,
+        }
+    }
+}
 
 pub fn default_studio_recording_quality() -> StudioRecordingQuality {
-    match detect_total_memory_bytes() {
-        Some(memory) if memory < COMPATIBILITY_MEMORY_THRESHOLD_BYTES => {
-            StudioRecordingQuality::Compatibility
-        }
-        _ => StudioRecordingQuality::Balanced,
-    }
+    cap_recording::default_studio_recording_quality().into()
 }
 
 impl MainWindowRecordingStartBehaviour {
     pub fn perform(&self, window: &tauri::WebviewWindow) -> tauri::Result<()> {
         match self {
-            Self::Close => window.hide(),
+            Self::Close => {
+                // On Windows, hide() leaves the DirectComposition surface composited on screen as
+                // a white ghost box. minimize() releases the surface without leaving an artifact.
+                #[cfg(windows)]
+                return window.minimize();
+                #[cfg(not(windows))]
+                window.hide()
+            }
             Self::Minimise => window.minimize(),
         }
     }
 }
 
+// NOTE: Do not add "Cap Target Select" here — on Windows, WDA_EXCLUDEFROMCAPTURE applied to that
+// hidden window causes it to reappear as a ghost overlay after recording ends.
 const DEFAULT_EXCLUDED_WINDOW_TITLES: &[&str] = &[
     "Cap",
     "Cap Settings",
     "Cap Recording Controls",
     "Cap Camera",
-    "Cap Target Select",
     "Cap Window Capture Occluder",
     "Cap Capture Area",
     "Cap Mode Selection",
     "Cap Recordings Overlay",
+    "Cap Teleprompter",
 ];
 
 pub fn default_excluded_windows() -> Vec<WindowExclusion> {
@@ -163,7 +178,10 @@ pub struct GeneralSettingsStore {
     pub post_studio_recording_behaviour: PostStudioRecordingBehaviour,
     #[serde(default)]
     pub main_window_recording_start_behaviour: MainWindowRecordingStartBehaviour,
-    #[serde(default = "default_true", rename = "custom_cursor_capture2")]
+    #[serde(
+        default = "default_custom_cursor_capture",
+        rename = "custom_cursor_capture2"
+    )]
     pub custom_cursor_capture: bool,
     #[serde(default = "default_server_url")]
     pub server_url: String,
@@ -176,7 +194,7 @@ pub struct GeneralSettingsStore {
     pub enable_native_camera_preview: bool,
     #[serde(default = "default_true")]
     pub auto_zoom_on_clicks: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_capture_keyboard_events")]
     pub capture_keyboard_events: bool,
     #[serde(default)]
     pub post_deletion_behaviour: PostDeletionBehaviour,
@@ -188,7 +206,7 @@ pub struct GeneralSettingsStore {
     pub instant_mode_max_resolution: u32,
     #[serde(default)]
     pub default_project_name_template: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_crash_recovery_recording")]
     pub crash_recovery_recording: bool,
     #[serde(default = "default_max_fps")]
     pub max_fps: u32,
@@ -210,10 +228,24 @@ pub struct GeneralSettingsStore {
     pub enable_telemetry: bool,
     #[serde(default)]
     pub out_of_process_muxer: bool,
+    #[serde(default)]
+    pub recordings_path: Option<String>,
+    /// Custom recordings folders that were used before; recordings left in
+    /// them stay visible in the library. Most recent last.
+    #[serde(default)]
+    pub previous_recordings_paths: Vec<String>,
+    /// App version at which camera background blur was disabled after a crash
+    /// was attributed to the blur pipeline; `None` means blur is allowed.
+    /// Cleared automatically when the app version changes (one retry per
+    /// update, since a new ort/wgpu/driver stack may have fixed the crash).
+    #[serde(default)]
+    pub camera_blur_disabled_by_crash: Option<String>,
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
 }
 
 fn default_enable_native_camera_preview() -> bool {
-    cfg!(all(debug_assertions, target_os = "macos"))
+    false
 }
 
 fn no(_: &bool) -> bool {
@@ -225,11 +257,23 @@ fn default_true() -> bool {
 }
 
 fn default_instant_mode_max_resolution() -> u32 {
-    1920
+    cap_recording::DEFAULT_INSTANT_MODE_MAX_RESOLUTION
 }
 
 fn default_max_fps() -> u32 {
-    60
+    cap_recording::DEFAULT_STUDIO_MAX_FPS
+}
+
+fn default_custom_cursor_capture() -> bool {
+    cap_recording::DEFAULT_CUSTOM_CURSOR_CAPTURE
+}
+
+fn default_capture_keyboard_events() -> bool {
+    cap_recording::DEFAULT_CAPTURE_KEYBOARD_EVENTS
+}
+
+fn default_crash_recovery_recording() -> bool {
+    cap_recording::DEFAULT_CRASH_RECOVERY_RECORDING
 }
 
 fn default_transcription_hints() -> Vec<String> {
@@ -272,19 +316,21 @@ impl Default for GeneralSettingsStore {
             window_transparency: false,
             post_studio_recording_behaviour: PostStudioRecordingBehaviour::OpenEditor,
             main_window_recording_start_behaviour: MainWindowRecordingStartBehaviour::Close,
-            custom_cursor_capture: true,
+            custom_cursor_capture: cap_recording::DEFAULT_CUSTOM_CURSOR_CAPTURE,
             server_url: default_server_url(),
             recording_countdown: Some(3),
             enable_native_camera_preview: default_enable_native_camera_preview(),
-            auto_zoom_on_clicks: false,
-            capture_keyboard_events: true,
+            // Keep aligned with the field's serde `default_true`: auto zooms
+            // are on by default, matching configs that never stored the key.
+            auto_zoom_on_clicks: true,
+            capture_keyboard_events: cap_recording::DEFAULT_CAPTURE_KEYBOARD_EVENTS,
             post_deletion_behaviour: PostDeletionBehaviour::DoNothing,
             excluded_windows: default_excluded_windows(),
             delete_instant_recordings_after_upload: false,
-            instant_mode_max_resolution: 1920,
+            instant_mode_max_resolution: cap_recording::DEFAULT_INSTANT_MODE_MAX_RESOLUTION,
             default_project_name_template: None,
-            crash_recovery_recording: true,
-            max_fps: 60,
+            crash_recovery_recording: cap_recording::DEFAULT_CRASH_RECOVERY_RECORDING,
+            max_fps: cap_recording::DEFAULT_STUDIO_MAX_FPS,
             transcription_hints: default_transcription_hints(),
             editor_preview_quality: EditorPreviewQuality::Half,
             studio_recording_quality: default_studio_recording_quality(),
@@ -293,7 +339,11 @@ impl Default for GeneralSettingsStore {
             camera_window_positions_by_monitor_name: BTreeMap::new(),
             has_completed_onboarding: false,
             enable_telemetry: true,
-            out_of_process_muxer: false,
+            out_of_process_muxer: cap_recording::DEFAULT_OUT_OF_PROCESS_MUXER,
+            recordings_path: None,
+            previous_recordings_paths: Vec::new(),
+            camera_blur_disabled_by_crash: None,
+            update_channel: UpdateChannel::Stable,
         }
     }
 }
@@ -308,6 +358,54 @@ pub enum AppTheme {
 }
 
 impl GeneralSettingsStore {
+    pub fn recordings_dir(app: &AppHandle<Wry>) -> std::path::PathBuf {
+        let custom = Self::get(app)
+            .map_err(|e| tracing::warn!("Failed to read general settings for recordings_dir: {e}"))
+            .ok()
+            .flatten()
+            .and_then(|s| s.recordings_path)
+            .and_then(|p| {
+                let path = std::path::PathBuf::from(&p);
+                if path.is_absolute() { Some(path) } else { None }
+            });
+
+        // A custom folder can become unavailable (unplugged drive, deleted
+        // path). Recording must keep working, so fall back to the default
+        // location instead of failing; the library lists recordings from
+        // every known folder, so nothing goes missing when this happens.
+        if let Some(path) = custom {
+            match std::fs::create_dir_all(&path) {
+                Ok(()) => return path,
+                Err(e) => {
+                    tracing::warn!(
+                        ?path, %e,
+                        "Custom recordings directory unavailable; falling back to default"
+                    );
+                }
+            }
+        }
+
+        let path = app.path().app_data_dir().unwrap().join("recordings");
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!(?path, %e, "Failed to create recordings directory");
+        }
+        path
+    }
+
+    // The effective value: the native preview is macOS-only; it is not
+    // reliable on Windows, so the stored setting is ignored there and the
+    // websocket preview is always used.
+    pub fn native_camera_preview_enabled(app: &AppHandle<Wry>) -> bool {
+        if cfg!(not(target_os = "macos")) {
+            return false;
+        }
+        Self::get(app)
+            .ok()
+            .flatten()
+            .map(|settings| settings.enable_native_camera_preview)
+            .unwrap_or_else(default_enable_native_camera_preview)
+    }
+
     pub fn get(app: &AppHandle<Wry>) -> Result<Option<Self>, String> {
         match app.store("store").map(|s| s.get("general_settings")) {
             Ok(Some(store)) => {
@@ -383,8 +481,30 @@ pub fn init(app: &AppHandle) {
     };
 
     append_missing_default_excluded_windows(&mut store.excluded_windows);
+
+    const REMOVE_TARGET_SELECT_MIGRATION_KEY: &str = "remove_cap_target_select_exclusion_v1";
+    if let Ok(raw_store) = app.store("store")
+        && raw_store.get(REMOVE_TARGET_SELECT_MIGRATION_KEY).is_none()
+    {
+        store
+            .excluded_windows
+            .retain(|w| w.window_title.as_deref() != Some("Cap Target Select"));
+        raw_store.set(REMOVE_TARGET_SELECT_MIGRATION_KEY, json!(true));
+    }
+
     crate::posthog::set_telemetry_enabled(store.enable_telemetry);
     register_bundled_muxer_binary(app);
+
+    #[cfg(target_os = "macos")]
+    {
+        const NATIVE_PREVIEW_MIGRATION_KEY: &str = "native_camera_preview_default_rollback_v1";
+        if let Ok(raw_store) = app.store("store")
+            && raw_store.get(NATIVE_PREVIEW_MIGRATION_KEY).is_none()
+        {
+            store.enable_native_camera_preview = false;
+            raw_store.set(NATIVE_PREVIEW_MIGRATION_KEY, json!(true));
+        }
+    }
 
     if let Err(e) = store.save(app) {
         error!("Failed to save general settings: {}", e);

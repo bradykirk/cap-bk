@@ -2,10 +2,10 @@ import { Button } from "@cap/ui-solid";
 import { A, type RouteSectionProps, useNavigate } from "@solidjs/router";
 import { createQuery, useQueryClient } from "@tanstack/solid-query";
 import { getVersion } from "@tauri-apps/api/app";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import * as dialog from "@tauri-apps/plugin-dialog";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import * as shell from "@tauri-apps/plugin-shell";
-import { check } from "@tauri-apps/plugin-updater";
 import {
 	createEffect,
 	createMemo,
@@ -17,15 +17,22 @@ import {
 	Show,
 	Suspense,
 } from "solid-js";
+import toast from "solid-toast";
 import { CapErrorBoundary } from "~/components/CapErrorBoundary";
 import { SignInButton } from "~/components/SignInButton";
 
 import { authStore, userProfileStore } from "~/store";
 import { trackEvent } from "~/utils/analytics";
 import { createSignInMutation } from "~/utils/auth";
-import { clientEnv } from "~/utils/env";
-import { apiClient, protectedHeaders } from "~/utils/web-api";
+import { commands } from "~/utils/tauri";
+import {
+	apiClient,
+	getConfiguredServerUrl,
+	protectedHeaders,
+} from "~/utils/web-api";
+import IconLucideTerminal from "~icons/lucide/terminal";
 import IconLucideUserRound from "~icons/lucide/user-round";
+import IconLucideZap from "~icons/lucide/zap";
 
 const USER_PROFILE_CACHE_GC_MS = 2 * 60 * 60 * 1000;
 const USER_PROFILE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -53,7 +60,7 @@ function isCachedProfileForUser(
 async function loadProfileImageObjectUrl(signal: AbortSignal) {
 	const imageUrl = new URL(
 		"/api/desktop/user/profile/image",
-		clientEnv.VITE_SERVER_URL,
+		await getConfiguredServerUrl(),
 	).toString();
 
 	const response = await tauriFetch(imageUrl, {
@@ -198,6 +205,11 @@ export default function Settings(props: RouteSectionProps) {
 			icon: IconCapHotkeys,
 		},
 		{
+			href: "cli",
+			name: "CLI",
+			icon: IconLucideTerminal,
+		},
+		{
 			href: "recordings",
 			name: "Recordings",
 			icon: IconLucideSquarePlay,
@@ -206,6 +218,11 @@ export default function Settings(props: RouteSectionProps) {
 			href: "screenshots",
 			name: "Screenshots",
 			icon: IconLucideImage,
+		},
+		{
+			href: "automations",
+			name: "Automations",
+			icon: IconLucideZap,
 		},
 		{
 			href: "transcription",
@@ -260,8 +277,8 @@ export default function Settings(props: RouteSectionProps) {
 	});
 	const accountImageUrl = createMemo(() => profileImageObjectUrl());
 	const openDashboard = () => {
-		void shell.open(
-			new URL("/dashboard", clientEnv.VITE_SERVER_URL).toString(),
+		void getConfiguredServerUrl().then((serverUrl) =>
+			shell.open(new URL("/dashboard", serverUrl).toString()),
 		);
 	};
 	const handleProfileClick = () => {
@@ -390,12 +407,21 @@ export default function Settings(props: RouteSectionProps) {
 			await clearLocalAuth();
 		}
 	};
+	const copyVersion = async (appVersion: string) => {
+		try {
+			await writeText(appVersion);
+			toast.success("Version copied to clipboard");
+		} catch (error) {
+			console.error("Failed to copy app version:", error);
+			toast.error("Failed to copy version");
+		}
+	};
 
 	const checkForUpdates = async () => {
 		setIsCheckingForUpdates(true);
 
 		try {
-			const update = await check();
+			const update = await commands.updatesCheck();
 
 			if (!update) {
 				await dialog.message(
@@ -416,10 +442,13 @@ export default function Settings(props: RouteSectionProps) {
 			if (shouldUpdate) navigate("/update");
 		} catch (e) {
 			console.error("Failed to check for updates:", e);
-			await dialog.message(
-				"Unable to check for updates. Please download the latest version manually from cap.so/download. Your data will not be lost.\n\nIf this issue persists, please contact support.",
-				{ title: "Update Error", kind: "error" },
-			);
+			const openDownload = await dialog
+				.confirm(
+					"Couldn't check for updates automatically. You can download the latest version of Cap from cap.so/download \u2014 your data won't be lost.",
+					{ title: "Update Cap", okLabel: "Download", cancelLabel: "Later" },
+				)
+				.catch(() => false);
+			if (openDownload) await shell.open("https://cap.so/download");
 		} finally {
 			setIsCheckingForUpdates(false);
 		}
@@ -489,7 +518,15 @@ export default function Settings(props: RouteSectionProps) {
 					<Show when={version()}>
 						{(v) => (
 							<div class="mb-2 text-xs text-gray-11 flex flex-col items-start gap-1.5">
-								<span>v{v()}</span>
+								<button
+									type="button"
+									class="-ml-1 cursor-copy rounded px-1 py-0.5 transition-colors hover:bg-gray-3 hover:text-gray-12"
+									title="Copy version to clipboard"
+									aria-label={`Copy version ${v()} to clipboard`}
+									onClick={() => copyVersion(v())}
+								>
+									v{v()}
+								</button>
 								<div class="flex flex-col items-start gap-1.5">
 									<button
 										type="button"
@@ -530,7 +567,7 @@ export default function Settings(props: RouteSectionProps) {
 					</Show>
 				</div>
 			</div>
-			<div class="cap-settings-content overflow-y-hidden flex-1 animate-in min-w-0">
+			<div class="cap-settings-content overflow-y-hidden flex-1 min-w-0">
 				<CapErrorBoundary>
 					<Suspense fallback={<SettingsContentSkeleton />}>
 						{props.children}

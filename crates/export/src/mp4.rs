@@ -1,5 +1,5 @@
 use crate::ExporterBase;
-use cap_editor::{AudioRenderer, get_audio_segments};
+use cap_editor::{AudioRenderer, get_audio_segments, load_music_tracks_uncached};
 use cap_enc_ffmpeg::{AudioEncoder, aac::AACEncoder, h264::H264Encoder, mp4::*};
 use cap_media_info::{RawVideoFormat, VideoInfo};
 use cap_project::XY;
@@ -178,12 +178,14 @@ impl Mp4ExportSettings {
             VideoInfo::from_raw(RawVideoFormat::Nv12, output_size.0, output_size.1, fps);
         video_info.time_base = ffmpeg::Rational::new(1, fps as i32);
 
-        let audio_segments = get_audio_segments(&base.segments);
+        let audio_segments = get_audio_segments(&base.segments).await;
+        let music = load_music_tracks_uncached(&base.project_config, &base.project_path);
 
-        let has_audio = audio_segments
+        let has_recording_audio = audio_segments
             .first()
             .filter(|_| !base.project_config.audio.mute)
             .is_some();
+        let has_audio = has_recording_audio || !music.is_empty();
 
         let record_first_queued_ms = mode.record_first_queued_ms_since_pipeline;
         let nv12_render_startup_breakdown_ms = mode.nv12_render_startup_breakdown_ms;
@@ -223,7 +225,7 @@ impl Mp4ExportSettings {
             info!("Created MP4File encoder (NV12, external conversion, export settings)");
 
             let mut audio_renderer = if has_audio {
-                Some(AudioRenderer::new(audio_segments))
+                Some(AudioRenderer::new(audio_segments).with_music(music))
             } else {
                 None
             };
@@ -252,12 +254,11 @@ impl Mp4ExportSettings {
                     let (pts, samples) =
                         audio_frame_budget(n, sample_rate, fps_u64, audio_sample_cursor)?;
                     audio_sample_cursor = pts as u64 + samples as u64;
-                    audio
+                    let mut frame = audio
                         .render_frame(samples, &project_for_audio)
-                        .map(|mut frame| {
-                            frame.set_pts(Some(pts));
-                            frame
-                        })
+                        .unwrap_or_else(|| silent_audio_frame(samples));
+                    frame.set_pts(Some(pts));
+                    Some(frame)
                 });
 
                 fill_nv12_frame_direct(
@@ -470,6 +471,19 @@ fn audio_frame_budget(
         return None;
     }
     Some((cursor as i64, (end - cursor) as usize))
+}
+
+fn silent_audio_frame(samples: usize) -> ffmpeg::frame::Audio {
+    let mut frame = ffmpeg::frame::Audio::new(
+        AudioRenderer::SAMPLE_FORMAT,
+        samples,
+        ffmpeg::ChannelLayout::STEREO,
+    );
+    frame.set_rate(AudioRenderer::SAMPLE_RATE);
+    for plane in 0..frame.planes() {
+        frame.data_mut(plane).fill(0);
+    }
+    frame
 }
 
 fn fill_nv12_frame_direct(
@@ -776,6 +790,22 @@ mod tests {
                 cursor = pts as u64 + samples as u64;
             }
             assert_eq!(cursor, (frames * sample_rate) / fps);
+        }
+    }
+
+    #[test]
+    fn silent_audio_frame_matches_renderer_format() {
+        ffmpeg::init().unwrap();
+
+        let samples = 1600usize;
+        let frame = silent_audio_frame(samples);
+
+        assert_eq!(frame.samples(), samples);
+        assert_eq!(frame.rate(), AudioRenderer::SAMPLE_RATE);
+        assert_eq!(frame.format(), AudioRenderer::SAMPLE_FORMAT);
+        assert_eq!(frame.channel_layout(), ffmpeg::ChannelLayout::STEREO);
+        for plane in 0..frame.planes() {
+            assert!(frame.data(plane).iter().all(|byte| *byte == 0));
         }
     }
 

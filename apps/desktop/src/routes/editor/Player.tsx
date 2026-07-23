@@ -11,6 +11,12 @@ import Tooltip from "~/components/Tooltip";
 import { captionsStore } from "~/store/captions";
 import { commands } from "~/utils/tauri";
 import AspectRatioSelect from "./AspectRatioSelect";
+import {
+	CanvasElementsOverlay,
+	SnapGuidesOverlay,
+} from "./CanvasElementsOverlay";
+import { CaptionOverlay } from "./CaptionOverlay";
+import { CaptionsRegenerateBadge } from "./CaptionsRegenerateBadge";
 import { createCaptionTrackSegments } from "./captions";
 import {
 	type EditorPreviewQuality,
@@ -18,8 +24,10 @@ import {
 	serializeProjectConfiguration,
 	useEditorContext,
 } from "./context";
+import { FrameButton } from "./FrameButton";
 import { MaskOverlay } from "./MaskOverlay";
 import { PerformanceOverlay } from "./PerformanceOverlay";
+import { SplitScreenOverlay } from "./SplitScreenOverlay";
 import { TextOverlay } from "./TextOverlay";
 import {
 	EditorButton,
@@ -32,14 +40,6 @@ import {
 import { useEditorShortcuts } from "./useEditorShortcuts";
 import { formatTime } from "./utils";
 
-function logCropProfile(
-	stage: string,
-	data: Record<string, number | string | boolean | null> = {},
-) {
-	if (!import.meta.env.DEV) return;
-	console.info("[crop-profile]", stage, data);
-}
-
 export function PlayerContent() {
 	const {
 		project,
@@ -50,7 +50,6 @@ export function PlayerContent() {
 		setEditorState,
 		zoomOutLimit,
 		setProject,
-		canvasControls,
 		previewResolutionBase,
 		previewQuality,
 		setPreviewQuality,
@@ -87,6 +86,7 @@ export function PlayerContent() {
 							text: segment.text,
 						})),
 						settings: { ...captionsStore.state.settings },
+						sourceTimed: true,
 					};
 					projectDidChange = true;
 				}
@@ -108,6 +108,7 @@ export function PlayerContent() {
 							sceneSegments: [],
 							maskSegments: [],
 							textSegments: [],
+							transitions: [],
 						}),
 						captionSegments: createCaptionTrackSegments(captionSegments),
 					};
@@ -157,31 +158,7 @@ export function PlayerContent() {
 	};
 
 	const cropDialogHandler = async () => {
-		const startedAt = performance.now();
 		const display = editorInstance.recordings.segments[0].display;
-		const controls = canvasControls();
-		let previewUrl: string | null = null;
-		logCropProfile("click", {
-			recordingDurationSec: Math.round(editorInstance.recordingDuration),
-			playbackTimeSec: Number(editorState.playbackTime.toFixed(3)),
-			displayWidth: display.width,
-			displayHeight: display.height,
-			wasPlaying: editorState.playing,
-		});
-		if (controls?.hasRenderedFrame()) {
-			try {
-				const previewFrame = await controls.captureFrame();
-				if (previewFrame) {
-					previewUrl = URL.createObjectURL(previewFrame);
-				}
-			} catch (error) {
-				console.warn("Preview frame capture failed:", error);
-			}
-		}
-		logCropProfile("preview-frame-captured", {
-			elapsedMs: Number((performance.now() - startedAt).toFixed(2)),
-			available: previewUrl !== null,
-		});
 		setDialog({
 			open: true,
 			type: "crop",
@@ -194,15 +171,8 @@ export function PlayerContent() {
 					y: display.height,
 				}),
 			},
-			previewUrl,
-		});
-		logCropProfile("dialog-opened", {
-			elapsedMs: Number((performance.now() - startedAt).toFixed(2)),
 		});
 		await commands.stopPlayback();
-		logCropProfile("playback-stopped", {
-			elapsedMs: Number((performance.now() - startedAt).toFixed(2)),
-		});
 		setEditorState("playing", false);
 	};
 
@@ -326,6 +296,7 @@ export function PlayerContent() {
 					>
 						Crop
 					</EditorButton>
+					<FrameButton />
 				</div>
 				<div class="flex items-center gap-2">
 					<span class="text-xs font-medium text-gray-11">Preview quality</span>
@@ -402,6 +373,7 @@ export function PlayerContent() {
 							await commands.stopPlayback();
 							setEditorState("playing", false);
 							setEditorState("playbackTime", 0);
+							editorState.timeline.transform.setPosition(0);
 						}}
 					>
 						<IconCapPrev class="text-gray-12 size-3" />
@@ -636,6 +608,7 @@ function PreviewCanvas() {
 			style={{ contain: "layout style" }}
 			onContextMenu={handleContextMenu}
 		>
+			<CaptionsRegenerateBadge class="absolute top-3 right-3 z-20" />
 			<div
 				class="flex overflow-hidden absolute inset-0 justify-center items-center h-full"
 				style={{ visibility: hasFrame() ? "visible" : "hidden" }}
@@ -660,8 +633,12 @@ function PreviewCanvas() {
 						id="canvas"
 					/>
 					<Show when={hasFrame()}>
+						<CanvasElementsOverlay size={size()} />
 						<MaskOverlay size={size()} />
+						<CaptionOverlay size={size()} />
 						<TextOverlay size={size()} />
+						<SplitScreenOverlay size={size()} />
+						<SnapGuidesOverlay size={size()} />
 						<PerformanceOverlay size={size()} />
 					</Show>
 				</div>

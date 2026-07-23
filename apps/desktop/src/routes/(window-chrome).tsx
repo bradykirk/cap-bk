@@ -102,6 +102,7 @@ function Header() {
 
 	const isWindows = ostype() === "windows";
 	const isMacOS = ostype() === "macos";
+	const isLinux = ostype() === "linux";
 	const isSettings = () => location.pathname.startsWith("/settings");
 
 	if (isMacOS && isSettings()) return null;
@@ -115,12 +116,20 @@ function Header() {
 			data-tauri-drag-region
 		>
 			{ctx.state()?.items}
-			{isWindows && <CaptionControlsWindows11 class="ml-auto!" />}
-			{isMacOS && !isSettings() && (
+			{isWindows && (
+				<CaptionControlsWindows11
+					class="ml-auto!"
+					maximizable={ctx.state()?.onMaximize ? true : undefined}
+					maximized={ctx.state()?.maximized}
+					onMaximize={ctx.state()?.onMaximize}
+				/>
+			)}
+			{((isMacOS && !isSettings()) || isLinux) && (
 				<CaptionControlsMacOS
 					class="mr-auto! ml-3"
 					showMinimize={false}
-					showZoom={false}
+					showZoom={ctx.state()?.onMaximize !== undefined}
+					onZoom={ctx.state()?.onMaximize}
 				/>
 			)}
 		</header>
@@ -128,21 +137,16 @@ function Header() {
 }
 
 function Inner(props: ParentProps) {
-	onMount(() => {
-		const initialTargetMode = (
-			window as typeof window & {
-				__CAP__?: { initialTargetMode?: unknown };
-			}
-		).__CAP__?.initialTargetMode;
+	const location = useLocation();
 
-		if (location.pathname !== "/" || !initialTargetMode)
-			void getCurrentWindow().show();
+	onMount(() => {
+		if (location.pathname !== "/") void getCurrentWindow().show();
 	});
 
 	return (
 		<div
 			data-tauri-drag-region="false"
-			class="cap-window-body flex overflow-hidden flex-col flex-1 animate-in fade-in"
+			class="cap-window-body flex overflow-hidden flex-col flex-1"
 		>
 			{props.children}
 		</div>

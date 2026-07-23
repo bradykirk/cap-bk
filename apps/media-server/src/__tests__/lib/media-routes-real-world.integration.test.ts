@@ -33,6 +33,9 @@ let baseUrl = "";
 let tempDir = "";
 
 const uploadedArtifacts = new Map<string, Uint8Array>();
+let transientFixtureFailures = 0;
+let permanentFixtureFailures = 0;
+let slowFixtureCancellations = 0;
 
 function fileUrl(path: string) {
 	return pathToFileURL(path).toString();
@@ -113,6 +116,12 @@ function uploadedBytes(pathname: string) {
 	return bytes;
 }
 
+async function uploadResponseBytes(pathname: string) {
+	const bytes = uploadedArtifacts.get(pathname);
+	if (!bytes) return null;
+	return bytes;
+}
+
 beforeAll(async () => {
 	mock.restore();
 	process.env.MEDIA_SERVER_WEBHOOK_SECRET = MEDIA_SERVER_SECRET;
@@ -132,12 +141,38 @@ beforeAll(async () => {
 			const url = new URL(request.url);
 
 			if (request.method === "GET" || request.method === "HEAD") {
+				if (url.pathname === "/fixtures/permanent-unavailable.m4s") {
+					permanentFixtureFailures++;
+					return new Response("Unavailable", { status: 503 });
+				}
+				if (url.pathname === "/fixtures/slow-segment.m4s") {
+					return new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(new Uint8Array(1024));
+							},
+							cancel() {
+								slowFixtureCancellations++;
+							},
+						}),
+					);
+				}
+				if (
+					request.method === "GET" &&
+					url.pathname === "/fixtures/transient-no-audio.mp4" &&
+					transientFixtureFailures < 2
+				) {
+					transientFixtureFailures++;
+					return new Response("Unavailable", { status: 503 });
+				}
 				const fixturePath =
 					url.pathname === "/fixtures/test-no-audio.mp4"
 						? TEST_VIDEO_NO_AUDIO
-						: url.pathname === "/fixtures/test-with-audio.mp4"
-							? TEST_VIDEO_WITH_AUDIO
-							: null;
+						: url.pathname === "/fixtures/transient-no-audio.mp4"
+							? TEST_VIDEO_NO_AUDIO
+							: url.pathname === "/fixtures/test-with-audio.mp4"
+								? TEST_VIDEO_WITH_AUDIO
+								: null;
 
 				if (fixturePath) {
 					const fixture = Bun.file(fixturePath);
@@ -151,11 +186,33 @@ beforeAll(async () => {
 				}
 			}
 
+			if (
+				(request.method === "GET" || request.method === "HEAD") &&
+				url.pathname.startsWith("/uploads/")
+			) {
+				const bytes = await uploadResponseBytes(url.pathname);
+				if (!bytes) return new Response("Not found", { status: 404 });
+				const headers = {
+					"Content-Type": "video/mp4",
+					"Content-Length": bytes.byteLength.toString(),
+				};
+				return request.method === "HEAD"
+					? new Response(null, { headers })
+					: new Response(Uint8Array.from(bytes).buffer, { headers });
+			}
+
 			if (request.method === "PUT" && url.pathname.startsWith("/uploads/")) {
-				uploadedArtifacts.set(
-					url.pathname,
-					new Uint8Array(await request.arrayBuffer()),
-				);
+				if (url.pathname === "/uploads/stale-edit-output.mp4") {
+					uploadedArtifacts.set(
+						url.pathname,
+						new Uint8Array(await Bun.file(TEST_VIDEO_WITH_AUDIO).arrayBuffer()),
+					);
+				} else {
+					uploadedArtifacts.set(
+						url.pathname,
+						new Uint8Array(await request.arrayBuffer()),
+					);
+				}
 				return new Response(null, { status: 200, statusText: "OK" });
 			}
 
@@ -168,6 +225,9 @@ beforeAll(async () => {
 beforeEach(() => {
 	mock.restore();
 	uploadedArtifacts.clear();
+	transientFixtureFailures = 0;
+	permanentFixtureFailures = 0;
+	slowFixtureCancellations = 0;
 });
 
 afterAll(() => {
@@ -292,6 +352,65 @@ describe("media routes real-world integration tests", () => {
 		}
 	}, 90000);
 
+	test("retries transient segment downloads and completes a real mux job", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", {
+				videoId: "real-mux-video",
+				userId: "real-mux-user",
+				outputPresignedUrl: uploadUrl("mux-output.mp4"),
+				videoInitUrl: `${baseUrl}/fixtures/transient-no-audio.mp4`,
+				videoSegmentUrls: [],
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		const data = (await response.json()) as { jobId: string };
+		const job = await waitForTerminalJob(data.jobId);
+		try {
+			expect(job.phase).toBe("complete");
+			expect(job.error).toBeUndefined();
+			expect(transientFixtureFailures).toBe(2);
+
+			const bytes = uploadedBytes("/uploads/mux-output.mp4");
+			expectMp4(bytes);
+			const metadata = await probeBytesAsMp4(bytes, "mux-output.mp4");
+			expect(metadata.videoCodec).toBe("h264");
+			expect(metadata.audioCodec).toBeNull();
+		} finally {
+			deleteJob(data.jobId);
+		}
+	}, 90000);
+
+	test("fails a mux job when a segment stays unavailable after retries", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/mux-segments", {
+				videoId: "failed-segment-mux-video",
+				userId: "failed-segment-mux-user",
+				outputPresignedUrl: uploadUrl("failed-segment-output.mp4"),
+				videoInitUrl: fixtureUrl("test-no-audio.mp4"),
+				videoSegmentUrls: [
+					`${baseUrl}/fixtures/permanent-unavailable.m4s`,
+					`${baseUrl}/fixtures/slow-segment.m4s`,
+				],
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		const data = (await response.json()) as { jobId: string };
+		const job = await waitForTerminalJob(data.jobId);
+		try {
+			expect(job.phase).toBe("error");
+			expect(job.error).toContain("503");
+			expect(permanentFixtureFailures).toBe(3);
+			expect(slowFixtureCancellations).toBe(1);
+			expect(uploadedArtifacts.has("/uploads/failed-segment-output.mp4")).toBe(
+				false,
+			);
+		} finally {
+			deleteJob(data.jobId);
+		}
+	}, 90000);
+
 	test("edits and uploads a real video job through the async route", async () => {
 		const response = await app.fetch(
 			mediaPostRequest("/video/edit", {
@@ -299,6 +418,7 @@ describe("media routes real-world integration tests", () => {
 				userId: "real-edit-user",
 				sourceUrl: fixtureUrl(),
 				outputPresignedUrl: uploadUrl("edit-output.mp4"),
+				outputVerificationUrl: uploadUrl("edit-output.mp4"),
 				keepRanges: [
 					{ start: 0, end: 0.4 },
 					{ start: 0.55, end: 0.95 },
@@ -320,6 +440,29 @@ describe("media routes real-world integration tests", () => {
 			expect(metadata.audioCodec).toBe("aac");
 			expect(metadata.duration).toBeGreaterThan(0.3);
 			expect(metadata.duration).toBeLessThan(1.2);
+		} finally {
+			deleteJob(data.jobId);
+		}
+	}, 90000);
+
+	test("fails an edit job when uploaded video verification sees stale bytes", async () => {
+		const response = await app.fetch(
+			mediaPostRequest("/video/edit", {
+				videoId: "stale-edit-video",
+				userId: "stale-edit-user",
+				sourceUrl: fixtureUrl(),
+				outputPresignedUrl: uploadUrl("stale-edit-output.mp4"),
+				outputVerificationUrl: uploadUrl("stale-edit-output.mp4"),
+				keepRanges: [{ start: 0, end: 0.1 }],
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		const data = (await response.json()) as { jobId: string };
+		const job = await waitForTerminalJob(data.jobId);
+		try {
+			expect(job.phase).toBe("error");
+			expect(job.error).toContain("Uploaded video duration mismatch");
 		} finally {
 			deleteJob(data.jobId);
 		}

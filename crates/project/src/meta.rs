@@ -38,18 +38,40 @@ pub struct AudioMeta {
     pub start_time: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_summary: Option<AudioGapSummary>,
+}
+
+/// Overlap-trim accounting captured by the recorder's audio gap tracker, persisted so the
+/// editor can compensate for stale-startup audio drift from typed data instead of scraping
+/// the recording log. See `cap-editor`'s `audio_timing_repair_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AudioGapSummary {
+    /// Total audio trimmed from overlapping frames over the whole recording, in milliseconds.
+    pub total_overlap_trimmed_ms: u32,
+    /// Startup-window trim used for stale-startup repair, excluding mid-recording trims.
+    #[serde(default)]
+    pub startup_overlap_trimmed_ms: u32,
+    /// Number of whole audio frames dropped because they fully overlapped the committed timeline.
+    pub overlap_dropped_frames: u32,
+    /// Subset of `overlap_dropped_frames` that dropped within the first few frames — the
+    /// signature of a stale buffered burst at capture start.
+    pub startup_overlap_drops: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SharingMeta {
     pub id: String,
     pub link: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub enum Platform {
     MacOS,
     Windows,
+    Linux,
 }
 
 impl Default for Platform {
@@ -57,8 +79,11 @@ impl Default for Platform {
         #[cfg(windows)]
         return Self::Windows;
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         return Self::MacOS;
+
+        #[cfg(target_os = "linux")]
+        return Self::Linux;
     }
 }
 
@@ -707,5 +732,76 @@ mod test {
 	          ]
 	        }"#,
         );
+    }
+
+    mod audio_offsets {
+        use crate::{AudioMeta, MultipleSegment, VideoMeta};
+        use relative_path::RelativePathBuf;
+
+        fn video(start_time: Option<f64>) -> VideoMeta {
+            VideoMeta {
+                path: RelativePathBuf::from("display.mp4"),
+                fps: 30,
+                start_time,
+                device_id: None,
+            }
+        }
+
+        fn audio(start_time: Option<f64>) -> AudioMeta {
+            AudioMeta {
+                path: RelativePathBuf::from("audio.ogg"),
+                start_time,
+                device_id: None,
+                gap_summary: None,
+            }
+        }
+
+        fn segment(
+            display_start: f64,
+            mic_start: Option<f64>,
+            system_start: Option<f64>,
+        ) -> MultipleSegment {
+            MultipleSegment {
+                display: video(Some(display_start)),
+                camera: None,
+                mic: mic_start.map(|s| audio(Some(s))),
+                system_audio: system_start.map(|s| audio(Some(s))),
+                cursor: None,
+                keyboard: None,
+            }
+        }
+
+        // The recorder anchors system audio at the recording epoch
+        // (start_time ~ 0.0), which keeps it from ever being the latest
+        // start_time: the mic/display anchor — and therefore where playback
+        // starts and how the mic aligns to video — must be identical with
+        // and without a system audio track.
+        #[test]
+        fn epoch_anchored_system_audio_does_not_move_the_anchor() {
+            let without = segment(0.58, Some(0.55), None);
+            let with = segment(0.58, Some(0.55), Some(0.0));
+
+            assert_eq!(without.latest_start_time(), Some(0.58));
+            assert_eq!(with.latest_start_time(), Some(0.58));
+
+            let offsets_without = without.calculate_audio_offsets();
+            let offsets_with = with.calculate_audio_offsets();
+            assert_eq!(offsets_without.mic, offsets_with.mic);
+            assert!((offsets_with.mic - 0.03).abs() < 1e-6);
+            // System audio positions itself by its own start.
+            assert!((offsets_with.system_audio - 0.58).abs() < 1e-6);
+        }
+
+        // Legacy recordings (pre-epoch-anchor) stamped system audio with its
+        // first packet time; those files keep their historical alignment:
+        // a later system start is still the anchor for them.
+        #[test]
+        fn legacy_first_packet_system_audio_keeps_historical_anchor() {
+            let legacy = segment(0.5824678, Some(0.5559852), Some(0.6586015));
+            assert_eq!(legacy.latest_start_time(), Some(0.6586015));
+            let offsets = legacy.calculate_audio_offsets();
+            assert!((offsets.mic - (0.6586015 - 0.5559852) as f32).abs() < 1e-6);
+            assert_eq!(offsets.system_audio, 0.0);
+        }
     }
 }

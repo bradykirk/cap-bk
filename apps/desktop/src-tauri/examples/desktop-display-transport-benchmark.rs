@@ -7,8 +7,9 @@ use std::{
 
 use cap_desktop_lib::frame_ws::{WSFrame, WSFrameFormat, create_watch_frame_ws};
 use cap_editor::{
-    EditorFrameOutput, Playback, PlaybackRenderOutputFormat, PlaybackSkipReason, PlaybackTelemetry,
-    PlaybackTelemetryEvent, Renderer, start_renderer_layers_creation,
+    EditorFrameOutput, FrameLayout, Playback, PlaybackRenderOutputFormat, PlaybackSkipReason,
+    PlaybackTelemetry, PlaybackTelemetryEvent, Renderer, finish_renderer_layers_creation,
+    start_renderer_layers_creation,
 };
 use cap_project::{
     ProjectConfiguration, RecordingMeta, RecordingMetaInner, StudioRecordingMeta,
@@ -57,6 +58,9 @@ impl Summary {
             PlaybackTelemetryEvent::RendererSendFailed { .. } => {
                 self.send_failures += 1;
             }
+            PlaybackTelemetryEvent::AudioSegmentsResolved { .. }
+            | PlaybackTelemetryEvent::AudioPipelineReady { .. }
+            | PlaybackTelemetryEvent::ClockStarted { .. } => {}
         }
     }
 
@@ -127,6 +131,8 @@ async fn load_recording(
                     start: 0.0,
                     end: duration,
                     timescale: 1.0,
+                    name: None,
+                    speed_audio_mode: None,
                 }]
             }
             StudioRecordingMeta::MultipleSegments { inner } => inner
@@ -144,6 +150,8 @@ async fn load_recording(
                         start: 0.0,
                         end: duration,
                         timescale: 1.0,
+                        name: None,
+                        speed_audio_mode: None,
                     })
                 })
                 .collect(),
@@ -152,12 +160,14 @@ async fn load_recording(
         if !timeline_segments.is_empty() {
             project.timeline = Some(TimelineConfiguration {
                 segments: timeline_segments,
+                transitions: Vec::new(),
                 zoom_segments: Vec::new(),
                 scene_segments: Vec::new(),
                 mask_segments: Vec::new(),
                 text_segments: Vec::new(),
                 caption_segments: Vec::new(),
                 keyboard_segments: Vec::new(),
+                audio_segments: Vec::new(),
             });
         }
     }
@@ -219,7 +229,8 @@ async fn main() {
     };
 
     let (frame_watch_tx, frame_watch_rx) = watch::channel(None);
-    let (ws_port, ws_shutdown_token) = create_watch_frame_ws(frame_watch_rx).await;
+    let (ws_port, ws_shutdown_token) =
+        create_watch_frame_ws(frame_watch_rx, Default::default()).await;
 
     println!("DISPLAY_WS_URL=ws://127.0.0.1:{ws_port}");
     println!(
@@ -229,7 +240,7 @@ async fn main() {
 
     tokio::time::sleep(Duration::from_millis(startup_delay_ms)).await;
 
-    let layers_rx = start_renderer_layers_creation(&render_constants);
+    let layers_rx = start_renderer_layers_creation(&render_constants, &project);
     let segment_medias =
         match cap_editor::create_segments(&recording_meta, meta.as_ref(), false).await {
             Ok(segments) => Arc::new(segments),
@@ -238,15 +249,16 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+    let layers_rx = finish_renderer_layers_creation(layers_rx).await;
 
     let (telemetry, mut telemetry_rx) = PlaybackTelemetry::channel();
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<usize>();
 
-    let frame_cb = Box::new(move |output: EditorFrameOutput| {
+    let frame_cb = Box::new(move |output: EditorFrameOutput, _: FrameLayout| {
         let ws_frame = match output {
             EditorFrameOutput::Nv12(frame) => {
                 let ws_format = match frame.format {
-                    GpuOutputFormat::Nv12 => WSFrameFormat::Nv12,
+                    GpuOutputFormat::Nv12 => WSFrameFormat::Nv12 { full_range: false },
                     GpuOutputFormat::Rgba => WSFrameFormat::Rgba,
                 };
                 let metadata_bytes = match frame.format {
@@ -290,8 +302,6 @@ async fn main() {
     let renderer = match Renderer::spawn_with_telemetry(
         render_constants.clone(),
         frame_cb,
-        &recording_meta,
-        meta.as_ref(),
         layers_rx,
         Some(telemetry.clone()),
     ) {
@@ -303,12 +313,15 @@ async fn main() {
     };
 
     let (_project_tx, project_rx) = watch::channel(project);
+    let audio_output = Arc::new(cap_editor::AudioOutput::new());
     let playback = Playback {
         renderer: renderer.clone(),
         render_constants,
         start_frame_number: 0,
         project: project_rx,
         segment_medias,
+        music: cap_editor::MusicTracks::new(),
+        audio_output,
         telemetry: Some(telemetry),
     };
 

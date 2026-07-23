@@ -15,11 +15,20 @@ import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { signIn } from "next-auth/react";
-import { Suspense, useEffect, useState } from "react";
+import {
+	Suspense,
+	useCallback,
+	useEffect,
+	useId,
+	useRef,
+	useState,
+} from "react";
 import { toast } from "sonner";
 import { getOrganizationSSOData } from "@/actions/organization/get-organization-sso-data";
 import { trackEvent } from "@/app/utils/analytics";
 import { usePublicEnv } from "@/utils/public-env";
+import { getEmailCodeCooldownSeconds, requestEmailCode } from "../auth-email";
+import { getSafeNextPath } from "../safe-next";
 
 const MotionInput = motion(Input);
 const MotionLogoBadge = motion(LogoBadge);
@@ -40,13 +49,25 @@ export function LoginForm() {
 	const [lastEmailSentTime, setLastEmailSentTime] = useState<number | null>(
 		null,
 	);
+	const mobileAppleSignInStarted = useRef(false);
+	const mobileGoogleSignInStarted = useRef(false);
+	const mobileWorkosSignInStarted = useRef(false);
+	const loginFormMounted = useRef(false);
 	const theme = Cookies.get("theme") || "light";
+	const getNextPath = useCallback(
+		() => (next ? getSafeNextPath(next, window.location.origin) : null),
+		[next],
+	);
 
 	useEffect(() => {
-		theme === "dark"
-			? (document.body.className = "dark")
-			: (document.body.className = "light");
-		//remove the dark mode when we leave the dashboard
+		loginFormMounted.current = true;
+		return () => {
+			loginFormMounted.current = false;
+		};
+	}, []);
+
+	useEffect(() => {
+		document.body.className = theme === "dark" ? "dark" : "light";
 		return () => {
 			document.body.className = "light";
 		};
@@ -104,16 +125,77 @@ export function LoginForm() {
 		}
 	}, [emailSent]);
 
-	const handleGoogleSignIn = () => {
+	const handleGoogleSignIn = useCallback(() => {
+		const nextPath = getNextPath();
 		trackEvent("auth_started", {
 			method: "google",
 			is_signup: false,
 			auth_surface: "login",
 		});
 		signIn("google", {
-			...(next && next.length > 0 ? { callbackUrl: next } : {}),
+			...(nextPath ? { callbackUrl: nextPath } : {}),
 		});
-	};
+	}, [getNextPath]);
+
+	const handleAppleSignIn = useCallback(() => {
+		const nextPath = getNextPath();
+		trackEvent("auth_started", {
+			method: "apple",
+			is_signup: false,
+			auth_surface: "login",
+		});
+		signIn("apple", {
+			...(nextPath ? { callbackUrl: nextPath } : {}),
+		});
+	}, [getNextPath]);
+
+	const handleWorkosSignIn = useCallback(
+		async (orgId: string) => {
+			const nextPath = getNextPath();
+			const data = await getOrganizationSSOData(
+				Organisation.OrganisationId.make(orgId),
+			);
+			setOrganizationName(data.name);
+
+			signIn("workos", nextPath ? { callbackUrl: nextPath } : undefined, {
+				organization: data.organizationId,
+				connection: data.connectionId,
+			});
+		},
+		[getNextPath],
+	);
+
+	useEffect(() => {
+		if (searchParams?.get("mobileProvider") === "apple") {
+			if (mobileAppleSignInStarted.current) return;
+			mobileAppleSignInStarted.current = true;
+			handleAppleSignIn();
+			return;
+		}
+
+		if (searchParams?.get("mobileProvider") === "google") {
+			if (mobileGoogleSignInStarted.current) return;
+			mobileGoogleSignInStarted.current = true;
+			handleGoogleSignIn();
+			return;
+		}
+
+		if (searchParams?.get("mobileProvider") !== "workos") return;
+		const mobileOrganizationId = searchParams.get("organizationId");
+		if (!mobileOrganizationId) {
+			setShowOrgInput(true);
+			return;
+		}
+		if (mobileWorkosSignInStarted.current) return;
+		mobileWorkosSignInStarted.current = true;
+
+		handleWorkosSignIn(mobileOrganizationId).catch(() => {
+			if (!loginFormMounted.current) return;
+			setOrganizationId(mobileOrganizationId);
+			setShowOrgInput(true);
+			toast.error("Organization not found or SSO not configured");
+		});
+	}, [handleAppleSignIn, handleGoogleSignIn, handleWorkosSignIn, searchParams]);
 
 	const handleOrganizationLookup = async (e: React.FormEvent) => {
 		e.preventDefault();
@@ -123,15 +205,7 @@ export function LoginForm() {
 		}
 
 		try {
-			const data = await getOrganizationSSOData(
-				Organisation.OrganisationId.make(organizationId),
-			);
-			setOrganizationName(data.name);
-
-			signIn("workos", undefined, {
-				organization: data.organizationId,
-				connection: data.connectionId,
-			});
+			await handleWorkosSignIn(organizationId);
 		} catch (error) {
 			console.error("Lookup Error:", error);
 			toast.error("Organization not found or SSO not configured");
@@ -248,73 +322,47 @@ export function LoginForm() {
 											ease: "easeInOut",
 											opacity: { delay: 0.05 },
 										}}
+										noValidate
 										onSubmit={async (e) => {
 											e.preventDefault();
-											if (!email) return;
 
-											// Check if we're rate limited on the client side
-											if (lastEmailSentTime) {
-												const timeSinceLastRequest =
-													Date.now() - lastEmailSentTime;
-												const waitTime = 30000; // 30 seconds
-												if (timeSinceLastRequest < waitTime) {
-													const remainingSeconds = Math.ceil(
-														(waitTime - timeSinceLastRequest) / 1000,
-													);
-													toast.error(
-														`Please wait ${remainingSeconds} seconds before requesting a new code`,
-													);
-													return;
-												}
+											const remainingSeconds =
+												getEmailCodeCooldownSeconds(lastEmailSentTime);
+											if (remainingSeconds > 0) {
+												toast.error(
+													`Please wait ${remainingSeconds} seconds before requesting a new code.`,
+												);
+												return;
 											}
 
 											setLoading(true);
-											trackEvent("auth_started", {
-												method: "email",
-												is_signup: false,
-												auth_surface: "login",
-											});
-											const normalizedEmail = email.trim().toLowerCase();
-											signIn("email", {
-												email: normalizedEmail,
-												redirect: false,
-												...(next && next.length > 0
-													? { callbackUrl: next }
-													: {}),
-											})
-												.then((res) => {
-													setLoading(false);
-
-													if (res?.ok && !res?.error) {
-														setEmailSent(true);
-														setLastEmailSentTime(Date.now());
-														trackEvent("auth_email_sent", {
-															method: "email",
-															is_signup: false,
-															auth_surface: "login",
-															email_domain: normalizedEmail.split("@")[1],
-														});
-														const params = new URLSearchParams({
-															email: normalizedEmail,
-															...(next && { next }),
-															lastSent: Date.now().toString(),
-														});
-														router.push(`/verify-otp?${params.toString()}`);
-													} else {
-														// NextAuth always returns "EmailSignin" for all email provider errors
-														// Since we already check rate limiting on the client side before sending,
-														// if we get an error here, it's likely rate limiting from the server
-														toast.error(
-															"Please wait 30 seconds before requesting a new code",
-														);
-													}
-												})
-												.catch((_error) => {
-													setEmailSent(false);
-													setLoading(false);
-													// Catch block is rarely triggered with NextAuth
-													toast.error("Error sending email - try again?");
+											try {
+												const nextPath = getNextPath();
+												const normalizedEmail = await requestEmailCode({
+													email,
+													next: nextPath,
+													isSignup: false,
+													authSurface: "login",
 												});
+												if (!normalizedEmail) return;
+
+												const sentAt = Date.now();
+												setEmailSent(true);
+												setLastEmailSentTime(sentAt);
+												const params = new URLSearchParams({
+													email: normalizedEmail,
+													...(nextPath && { next: nextPath }),
+													lastSent: sentAt.toString(),
+												});
+												router.push(`/verify-otp?${params.toString()}`);
+											} catch {
+												setEmailSent(false);
+												toast.error(
+													"Sign in is taking longer than expected. Check your connection or browser extensions, then try again.",
+												);
+											} finally {
+												setLoading(false);
+											}
 										}}
 										className="flex flex-col space-y-3"
 									>
@@ -372,6 +420,8 @@ const LoginWithSSO = ({
 	setOrganizationId: (organizationId: string) => void;
 	organizationName: string | null;
 }) => {
+	const organizationIdInputId = useId();
+
 	return (
 		<motion.form
 			layout
@@ -379,7 +429,7 @@ const LoginWithSSO = ({
 			className="relative space-y-2"
 		>
 			<MotionInput
-				id="organizationId"
+				id={organizationIdInputId}
 				placeholder="Enter your Organization ID..."
 				value={organizationId}
 				onChange={(e) => setOrganizationId(e.target.value)}
@@ -415,12 +465,13 @@ const NormalLogin = ({
 	handleGoogleSignIn: () => void;
 }) => {
 	const publicEnv = usePublicEnv();
+	const emailInputId = useId();
 
 	return (
 		<motion.div>
 			<motion.div layout className="flex flex-col space-y-3">
 				<MotionInput
-					id="email"
+					id={emailInputId}
 					name="email"
 					autoFocus
 					type="email"
@@ -437,9 +488,14 @@ const NormalLogin = ({
 					variant="dark"
 					type="submit"
 					disabled={loading || emailSent}
-					icon={<FontAwesomeIcon className="mr-1 size-4" icon={faEnvelope} />}
+					spinner={loading}
+					icon={
+						loading ? undefined : (
+							<FontAwesomeIcon className="mr-1 size-4" icon={faEnvelope} />
+						)
+					}
 				>
-					Login with email
+					{loading ? "Sending code..." : "Login with email"}
 				</MotionButton>
 				{/* {NODE_ENV === "development" && (
                   <div className="flex justify-center items-center px-6 py-3 mt-3 bg-red-600 rounded-xl">

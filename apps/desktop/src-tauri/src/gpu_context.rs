@@ -44,21 +44,52 @@ pub struct SharedGpuContext {
     pub adapter: Arc<wgpu::Adapter>,
     pub instance: Arc<wgpu::Instance>,
     pub is_software_adapter: bool,
+    pub background_cache: Arc<cap_rendering::BackgroundTextureCache>,
 }
 
 static GPU: OnceCell<Option<SharedGpuContext>> = OnceCell::const_new();
 
+/// Marks the crash sentinel while GPU adapter/device initialisation is in flight, so
+/// a process death inside that window is attributable to graphics bring-up. Dropping
+/// the guard (including during unwind from a caught panic) disarms the marker — a
+/// survivable failure is not a GPU crash.
+struct GpuInitPhaseGuard;
+
+impl GpuInitPhaseGuard {
+    fn arm() -> Self {
+        crate::crash_sentinel::enter_gpu_init_phase();
+        Self
+    }
+}
+
+impl Drop for GpuInitPhaseGuard {
+    fn drop(&mut self) {
+        crate::crash_sentinel::exit_gpu_init_phase();
+    }
+}
+
 async fn init_gpu_inner() -> Option<SharedGpuContext> {
+    let _gpu_init_phase = GpuInitPhaseGuard::arm();
+
     let instance = cap_rendering::create_wgpu_instance().await;
 
-    let hardware_adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .ok();
+    let force_software_adapter = cap_rendering::force_software_wgpu_adapter();
+    if force_software_adapter {
+        tracing::warn!("Forcing software WGPU adapter for shared context");
+    }
+
+    let hardware_adapter = if force_software_adapter {
+        None
+    } else {
+        instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .ok()
+    };
 
     let (adapter, is_software_adapter) = if let Some(adapter) = hardware_adapter {
         let adapter_info = adapter.get_info();
@@ -120,6 +151,7 @@ async fn init_gpu_inner() -> Option<SharedGpuContext> {
         adapter: Arc::new(adapter),
         instance: Arc::new(instance),
         is_software_adapter,
+        background_cache: Arc::new(cap_rendering::BackgroundTextureCache::default()),
     })
 }
 

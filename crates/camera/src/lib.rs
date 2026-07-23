@@ -1,5 +1,3 @@
-#![cfg(any(windows, target_os = "macos"))]
-
 use std::{
     fmt::{Debug, Display},
     ops::Deref,
@@ -15,6 +13,11 @@ use macos::*;
 mod windows;
 #[cfg(windows)]
 use windows::*;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::*;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -105,6 +108,10 @@ impl Debug for Format {
                         VideoFormatInner::MediaFoundation(_) => &"MediaFoundation",
                     }
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    &"Linux"
+                }
             })
             .finish()
     }
@@ -185,6 +192,23 @@ pub enum StartCapturingError {
     #[cfg(windows)]
     #[error("{0}")]
     Native(windows_core::Error),
+    #[cfg(target_os = "linux")]
+    #[error("{0}")]
+    Native(String),
+}
+
+/// How the capture session negotiates pixel format and device format.
+/// Only affects macOS; other platforms ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureMode {
+    /// Pin the device's active format and request its native pixel format from
+    /// the output, avoiding conversion overhead.
+    #[default]
+    Native,
+    /// Leave format and pixel-format negotiation entirely to the OS capture
+    /// stack, like a stock AVFoundation app. Costs a conversion but works with
+    /// devices that stall when the native format is forced.
+    Compatibility,
 }
 
 #[derive(Debug)]
@@ -209,12 +233,29 @@ impl CameraInfo {
     pub fn start_capturing(
         &self,
         format: Format,
-        callback: impl FnMut(CapturedFrame) + 'static,
+        callback: impl FnMut(CapturedFrame) + Send + 'static,
+    ) -> Result<CaptureHandle, StartCapturingError> {
+        self.start_capturing_with_mode(format, CaptureMode::default(), callback)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub fn start_capturing_with_mode(
+        &self,
+        format: Format,
+        mode: CaptureMode,
+        callback: impl FnMut(CapturedFrame) + Send + 'static,
     ) -> Result<CaptureHandle, StartCapturingError> {
         Ok(CaptureHandle {
             #[cfg(target_os = "macos")]
-            native: Some(start_capturing_impl(self, format, Box::new(callback))?),
+            native: Some(start_capturing_impl(
+                self,
+                format,
+                mode,
+                Box::new(callback),
+            )?),
             #[cfg(windows)]
+            native: Some(start_capturing_impl(self, format, Box::new(callback))?),
+            #[cfg(target_os = "linux")]
             native: Some(start_capturing_impl(self, format, Box::new(callback))?),
         })
     }

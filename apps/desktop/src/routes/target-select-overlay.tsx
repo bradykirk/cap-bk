@@ -4,7 +4,6 @@ import { createElementSize } from "@solid-primitives/resize-observer";
 import { makePersisted } from "@solid-primitives/storage";
 import { useSearchParams } from "@solidjs/router";
 import { createMutation, useQuery } from "@tanstack/solid-query";
-import { invoke } from "@tauri-apps/api/core";
 import {
 	LogicalPosition,
 	type PhysicalPosition,
@@ -23,6 +22,7 @@ import {
 	createEffect,
 	createMemo,
 	createSignal,
+	For,
 	Match,
 	mergeProps,
 	onCleanup,
@@ -58,6 +58,16 @@ import {
 import ModeSelect from "~/components/ModeSelect";
 import SelectionHint from "~/components/selection-hint";
 import { authStore, generalSettingsStore } from "~/store";
+import {
+	AREA_SELECTION_STORAGE_KEY,
+	AREA_SELECTION_STORAGE_SYNC,
+	type AreaSelectionPreferences,
+	createDefaultAreaSelectionPreferences,
+	cropBoundsEqual,
+	getLockedAreaBounds,
+	QUICK_AREA_RATIOS,
+	ratiosEqual,
+} from "~/utils/area-selection";
 import { getCameraWindow } from "~/utils/camera-window";
 import { createDevicesQuery } from "~/utils/devices";
 import {
@@ -65,6 +75,11 @@ import {
 	createOptionsQuery,
 	createOrganizationsQuery,
 } from "~/utils/queries";
+import {
+	type CanvasControls,
+	createImageDataWS,
+	type FrameData,
+} from "~/utils/socket";
 import {
 	type CameraInfo,
 	commands,
@@ -84,6 +99,9 @@ import {
 
 const MIN_SIZE = { width: 150, height: 150 };
 const MIN_SCREENSHOT_SIZE = { width: 1, height: 1 };
+const LOCKED_AREA_COMMIT_DELAY_MS = 180;
+const LIQUID_GLASS_SURFACE_CLASS =
+	"rounded-2xl border border-gray-12/10 bg-gray-1/82 shadow-xl shadow-black/20 backdrop-blur-xl dark:border-white/10 dark:bg-gray-2/82";
 
 const capitalize = (str: string) => {
 	return str.charAt(0).toUpperCase() + str.slice(1);
@@ -173,6 +191,15 @@ function Inner() {
 		targetMode: "display" | "window" | "area" | "camera";
 	}>();
 	const [options, setOptions] = useOptions();
+	const [areaSelectionPreferences, setAreaSelectionPreferences] = makePersisted(
+		createStore<AreaSelectionPreferences>(
+			createDefaultAreaSelectionPreferences(),
+		),
+		{
+			name: AREA_SELECTION_STORAGE_KEY,
+			sync: AREA_SELECTION_STORAGE_SYNC,
+		},
+	);
 
 	onMount(() => {
 		if (params.targetMode) {
@@ -310,10 +337,41 @@ function Inner() {
 	});
 
 	const unsubOnEscapePress = events.onEscapePress.listen(() => {
-		setOptions("targetMode", null);
+		setOptions({ targetMode: null, targetModeDismissal: "cancelled" });
 		commands.closeTargetSelectOverlays();
 	});
 	onCleanup(() => unsubOnEscapePress.then((f) => f()));
+
+	// Dismiss the picker because a recording is starting. The dismissal reason
+	// rides along with `targetMode: null` so the main window never has to guess
+	// (from possibly-stale query state) whether it may reveal itself again.
+	const dismissPickerForRecordingStart = () => {
+		if (options.mode === "screenshot") return;
+		const targetModeDismissal =
+			options.mode === "instant" ? "recordingInstant" : "recordingStudio";
+		if (options.targetModeSource === "editor") {
+			setOptions({
+				targetMode: null,
+				targetModeSource: "editorRecording",
+				targetModeDismissal,
+			});
+		} else {
+			setOptions({ targetMode: null, targetModeDismissal });
+		}
+		// Hide rather than close: startRecording is invoked from THIS webview right
+		// after dismissal, and closing destroys the webview before the invoke is
+		// dispatched — the recording then silently never starts. The backend closes
+		// these windows itself once the recording is underway, and the start handler
+		// closes them if the command fails.
+		void WebviewWindow.getAll().then((all) => {
+			for (const win of all) {
+				if (win.label.startsWith("target-select-overlay-")) {
+					void win.setIgnoreCursorEvents(true);
+					void win.hide();
+				}
+			}
+		});
+	};
 
 	// This prevents browser keyboard shortcuts from firing.
 	// Eg. on Windows Ctrl+P would open the print dialog without this
@@ -336,8 +394,12 @@ function Inner() {
 					<RecordingControls
 						target={{ variant: "cameraOnly" } as ScreenCaptureTarget}
 						showBackground
+						onRecordingStart={dismissPickerForRecordingStart}
 						onClose={() => {
-							setOptions("targetMode", null);
+							setOptions({
+								targetMode: null,
+								targetModeDismissal: "cancelled",
+							});
 							commands.closeTargetSelectOverlays();
 						}}
 					/>
@@ -386,8 +448,12 @@ function Inner() {
 						<RecordingControls
 							setToggleModeSelect={setToggleModeSelect}
 							target={{ variant: "display", id: displayId() }}
+							onRecordingStart={dismissPickerForRecordingStart}
 							onClose={() => {
-								setOptions("targetMode", null);
+								setOptions({
+									targetMode: null,
+									targetModeDismissal: "cancelled",
+								});
 								commands.closeTargetSelectOverlays();
 							}}
 						/>
@@ -621,13 +687,33 @@ function Inner() {
 												}}
 												onRecordingStart={() => {
 													setOriginalCameraBounds(null);
-													setOptions("targetMode", null);
-													commands.closeTargetSelectOverlays();
+													if (options.mode === "screenshot") {
+														// The window variant has always dismissed the picker
+														// for screenshots too; keep that, tagged as such.
+														if (options.targetModeSource === "editor") {
+															setOptions({
+																targetMode: null,
+																targetModeSource: "editorRecording",
+																targetModeDismissal: "screenshot",
+															});
+														} else {
+															setOptions({
+																targetMode: null,
+																targetModeDismissal: "screenshot",
+															});
+														}
+														commands.closeTargetSelectOverlays();
+													} else {
+														dismissPickerForRecordingStart();
+													}
 												}}
 												onClose={() => {
 													setSelectedWindow(null);
 													setLockedIcon(null);
-													setOptions("targetMode", null);
+													setOptions({
+														targetMode: null,
+														targetModeDismissal: "cancelled",
+													});
 													commands.closeTargetSelectOverlays();
 												}}
 											/>
@@ -711,10 +797,31 @@ function Inner() {
 						},
 					}));
 
-					const [aspect, setAspect] = createSignal<Ratio | null>(null);
-					const [snapToRatioEnabled, setSnapToRatioEnabled] =
-						createSignal(true);
 					const [isInteracting, setIsInteracting] = createSignal(false);
+					const [screenshotAspect, setScreenshotAspect] =
+						createSignal<Ratio | null>(null);
+					const [screenshotSnapToRatio, setScreenshotSnapToRatio] =
+						createSignal(true);
+					const minSize = () =>
+						options.mode === "screenshot" ? MIN_SCREENSHOT_SIZE : MIN_SIZE;
+					const currentAspect = () =>
+						options.mode === "screenshot"
+							? screenshotAspect()
+							: areaSelectionPreferences.aspectRatio;
+					const currentSnapToRatio = () =>
+						options.mode === "screenshot"
+							? screenshotSnapToRatio()
+							: areaSelectionPreferences.snapToRatio;
+					const effectiveInitialAreaBounds = createMemo(() => {
+						const explicitBounds = initialAreaBounds();
+						if (explicitBounds) return explicitBounds;
+						if (options.mode === "screenshot") return undefined;
+						return getLockedAreaBounds(
+							areaSelectionPreferences,
+							displayId(),
+							minSize(),
+						);
+					});
 					const isActiveDisplay = createMemo(() => {
 						const activeDisplayId = targetUnderCursor.display_id;
 						if (activeDisplayId) {
@@ -726,19 +833,100 @@ function Inner() {
 						() => isInteracting() || isActiveDisplay(),
 					);
 					const shouldShowSelectionHint = createMemo(() => {
-						if (initialAreaBounds() !== undefined) return false;
+						if (effectiveInitialAreaBounds() !== undefined) return false;
 						if (!isActiveDisplay()) return false;
 						const bounds = crop();
 						return bounds.width <= 1 && bounds.height <= 1 && !isInteracting();
 					});
 
-					const minSize = () =>
-						options.mode === "screenshot" ? MIN_SCREENSHOT_SIZE : MIN_SIZE;
-
 					const isValid = createMemo(() => {
 						const b = crop();
 						const min = minSize();
 						return b.width >= min.width && b.height >= min.height;
+					});
+					const isSelectionLocked = createMemo(
+						() =>
+							options.mode !== "screenshot" &&
+							getLockedAreaBounds(
+								areaSelectionPreferences,
+								displayId(),
+								minSize(),
+							) !== undefined,
+					);
+
+					function setAspect(aspect: Ratio | null) {
+						if (options.mode === "screenshot") {
+							setScreenshotAspect(aspect);
+							return;
+						}
+						setAreaSelectionPreferences(
+							"aspectRatio",
+							aspect ? [aspect[0], aspect[1]] : null,
+						);
+					}
+
+					function setSnapToRatio(enabled: boolean) {
+						if (options.mode === "screenshot") {
+							setScreenshotSnapToRatio(enabled);
+							return;
+						}
+						setAreaSelectionPreferences("snapToRatio", enabled);
+					}
+
+					function persistLockedSelection() {
+						if (
+							options.mode === "screenshot" ||
+							!areaSelectionPreferences.locked ||
+							areaSelectionPreferences.screenId !== displayId() ||
+							!isValid()
+						)
+							return;
+
+						const bounds = crop();
+						if (!cropBoundsEqual(areaSelectionPreferences.bounds, bounds))
+							setAreaSelectionPreferences("bounds", { ...bounds });
+					}
+
+					function toggleLockedSelection() {
+						if (isSelectionLocked()) {
+							setAreaSelectionPreferences("locked", false);
+							return;
+						}
+						if (!isValid()) return;
+
+						setAreaSelectionPreferences({
+							locked: true,
+							screenId: displayId(),
+							bounds: { ...crop() },
+						});
+					}
+
+					let lockedSelectionCommitTimer: ReturnType<typeof setTimeout> | null =
+						null;
+					createEffect(() => {
+						const bounds = crop();
+						if (lockedSelectionCommitTimer !== null) {
+							clearTimeout(lockedSelectionCommitTimer);
+							lockedSelectionCommitTimer = null;
+						}
+						if (
+							isInteracting() ||
+							options.mode === "screenshot" ||
+							!areaSelectionPreferences.locked ||
+							areaSelectionPreferences.screenId !== displayId() ||
+							!isValid() ||
+							cropBoundsEqual(areaSelectionPreferences.bounds, bounds)
+						)
+							return;
+
+						lockedSelectionCommitTimer = setTimeout(() => {
+							persistLockedSelection();
+							lockedSelectionCommitTimer = null;
+						}, LOCKED_AREA_COMMIT_DELAY_MS);
+					});
+					onCleanup(() => {
+						if (lockedSelectionCommitTimer !== null)
+							clearTimeout(lockedSelectionCommitTimer);
 					});
 
 					const [targetState, setTargetState] = createSignal<{
@@ -877,11 +1065,29 @@ function Inner() {
 								bounds.y + bounds.height - newHeight - padding,
 							);
 
+							// The command applies these as raw device pixels. On Windows
+							// that means converting with the scale of the display the
+							// target rect is on (the overlay's display) — the camera
+							// window's own scale is wrong when it starts on a monitor
+							// with different DPI. On macOS physical coordinates are
+							// interpreted relative to the camera window's scale, so its
+							// own factor is the correct (self-canceling) one, and on
+							// Linux scap reports logical == physical so the display
+							// ratio would collapse to 1 and lose the window scale.
+							const targetScale = (() => {
+								if (ostype() !== "windows") return scaleFactor;
+								const physicalWidth = displayInfo?.physical_size?.width;
+								const logicalWidth = displayInfo?.logical_size?.width;
+								return physicalWidth && logicalWidth && logicalWidth > 0
+									? physicalWidth / logicalWidth
+									: scaleFactor;
+							})();
+
 							setTargetState({
-								x: (newX + displayOriginX) * scaleFactor,
-								y: (newY + displayOriginY) * scaleFactor,
-								width: newWidth * scaleFactor,
-								height: newHeight * scaleFactor,
+								x: (newX + displayOriginX) * targetScale,
+								y: (newY + displayOriginY) * targetScale,
+								width: newWidth * targetScale,
+								height: newHeight * targetScale,
 							});
 						}
 					});
@@ -908,27 +1114,36 @@ function Inner() {
 						revertCamera();
 					});
 
+					function resetSelection() {
+						setAspect(null);
+						setPendingAreaTarget(null);
+						if (areaSelectionPreferences.screenId === displayId()) {
+							setAreaSelectionPreferences({
+								locked: false,
+								screenId: null,
+								bounds: null,
+							});
+						}
+						cropperRef?.reset();
+						revertCamera();
+					}
+
 					async function showCropOptionsMenu(e: UIEvent) {
 						e.preventDefault();
 						e.stopPropagation();
 						const items = [
 							{
 								text: "Reset selection",
-								action: () => {
-									cropperRef?.reset();
-									setAspect(null);
-									setPendingAreaTarget(null);
-									revertCamera();
-								},
+								action: resetSelection,
 							},
 							await PredefinedMenuItem.new({
 								item: "Separator",
 							}),
 							...createCropOptionsMenuItems({
-								aspect: aspect(),
-								snapToRatioEnabled: snapToRatioEnabled(),
+								aspect: currentAspect(),
+								snapToRatioEnabled: currentSnapToRatio(),
 								onAspectSet: setAspect,
-								onSnapToRatioSet: setSnapToRatioEnabled,
+								onSnapToRatioSet: setSnapToRatio,
 							}),
 						];
 						const menu = await Menu.new({ items });
@@ -1027,6 +1242,7 @@ function Inner() {
 						setWasInteracting(interacting);
 
 						if (was && !interacting) {
+							persistLockedSelection();
 							if (options.mode === "screenshot" && isValid()) {
 								const cropBounds = crop();
 								const displayInfo = areaDisplayInfo.data;
@@ -1068,10 +1284,12 @@ function Inner() {
 									}
 									await new Promise((resolve) => setTimeout(resolve, 50));
 
-									const path = await invoke<string>("take_screenshot", {
-										target,
-									});
-									await commands.showWindow({ ScreenshotEditor: { path } });
+									const path = await commands.takeScreenshot(target);
+									const shouldOpenEditor =
+										await commands.automationShouldOpenScreenshotEditor(target);
+									if (shouldOpenEditor) {
+										await commands.showWindow({ ScreenshotEditor: { path } });
+									}
 									await commands.closeTargetSelectOverlays();
 								} catch (e) {
 									const message = e instanceof Error ? e.message : String(e);
@@ -1089,6 +1307,118 @@ function Inner() {
 								"opacity-0 pointer-events-none": !shouldShowOverlay(),
 							}}
 						>
+							<Show when={isActiveDisplay()}>
+								<div
+									class="fixed left-1/2 z-[60] max-w-[calc(100vw-2rem)] -translate-x-1/2"
+									classList={{
+										"top-12": macos,
+										"top-4": !macos,
+									}}
+								>
+									<div
+										class={`${LIQUID_GLASS_SURFACE_CLASS} flex h-12 items-center gap-1.5 p-1.5 text-gray-12`}
+									>
+										<div class="min-w-28 px-2 text-base font-normal leading-none tracking-[-0.01em] tabular-nums">
+											{isValid()
+												? `${Math.round(crop().width)} × ${Math.round(crop().height)}`
+												: "Draw an area"}
+										</div>
+
+										<div class="h-6 w-px bg-gray-5" />
+
+										<div class="flex items-center gap-0.5 rounded-xl bg-gray-12/6 p-0.5">
+											<button
+												type="button"
+												class="h-8 rounded-lg px-2 text-xs font-normal transition-colors"
+												classList={{
+													"bg-gray-12/12 text-gray-12":
+														currentAspect() === null,
+													"text-gray-11 hover:bg-gray-12/8":
+														currentAspect() !== null,
+												}}
+												onClick={() => setAspect(null)}
+												aria-pressed={currentAspect() === null}
+											>
+												Free
+											</button>
+											<For each={QUICK_AREA_RATIOS}>
+												{(ratio) => {
+													const selected = () =>
+														ratiosEqual(currentAspect(), ratio);
+													return (
+														<button
+															type="button"
+															class="h-8 rounded-lg px-2 text-xs font-normal tabular-nums transition-colors"
+															classList={{
+																"bg-gray-12/12 text-gray-12": selected(),
+																"text-gray-11 hover:bg-gray-12/8": !selected(),
+															}}
+															onClick={() => setAspect(ratio)}
+															aria-pressed={selected()}
+														>
+															{ratio[0]}:{ratio[1]}
+														</button>
+													);
+												}}
+											</For>
+										</div>
+
+										<button
+											type="button"
+											class="flex size-9 items-center justify-center rounded-xl text-gray-11 transition-colors hover:bg-gray-12/8 hover:text-gray-12"
+											onClick={showCropOptionsMenu}
+											title="More aspect ratios"
+											aria-label="More aspect ratios"
+										>
+											<IconLucideRatio class="size-4" />
+										</button>
+
+										<div class="h-6 w-px bg-gray-5" />
+
+										<button
+											type="button"
+											class="flex size-9 items-center justify-center rounded-xl text-gray-11 transition-colors hover:bg-gray-12/8 hover:text-gray-12"
+											onClick={resetSelection}
+											title="Reset selection"
+											aria-label="Reset selection"
+										>
+											<IconLucideRotateCcw class="size-4" />
+										</button>
+										<button
+											type="button"
+											class="flex size-9 items-center justify-center rounded-xl text-gray-11 transition-colors hover:bg-gray-12/8 hover:text-gray-12"
+											onClick={() => cropperRef?.fill()}
+											title="Fill display"
+											aria-label="Fill display"
+										>
+											<IconLucideMaximize2 class="size-4" />
+										</button>
+										<Show when={options.mode !== "screenshot"}>
+											<button
+												type="button"
+												class="flex h-9 items-center gap-1.5 rounded-xl px-2.5 text-xs font-normal transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+												classList={{
+													"bg-blue-9 text-white shadow-sm": isSelectionLocked(),
+													"text-gray-11 hover:bg-gray-12/8 hover:text-gray-12":
+														!isSelectionLocked(),
+												}}
+												disabled={!isValid()}
+												onClick={toggleLockedSelection}
+												aria-pressed={isSelectionLocked()}
+												title={
+													isSelectionLocked()
+														? "Stop reusing this area"
+														: "Reuse this area for future recordings"
+												}
+											>
+												<IconLucideLock class="size-3.5" />
+												{isSelectionLocked() ? "Locked" : "Lock"}
+											</button>
+										</Show>
+									</div>
+								</div>
+							</Show>
+
 							<div
 								ref={controlsEl}
 								class="fixed z-50 transition-opacity"
@@ -1113,9 +1443,16 @@ function Inner() {
 											}}
 											disabled={!isValid()}
 											showBackground={controllerInside()}
-											onRecordingStart={() => setOriginalCameraBounds(null)}
+											onRecordingStart={() => {
+												persistLockedSelection();
+												setOriginalCameraBounds(null);
+												dismissPickerForRecordingStart();
+											}}
 											onClose={() => {
-												setOptions("targetMode", null);
+												setOptions({
+													targetMode: null,
+													targetModeDismissal: "cancelled",
+												});
 												commands.closeTargetSelectOverlays();
 											}}
 										/>
@@ -1147,10 +1484,10 @@ function Inner() {
 								ref={cropperRef}
 								onInteraction={setIsInteracting}
 								onCropChange={setCrop}
-								initialCrop={() => initialAreaBounds() ?? CROP_ZERO}
+								initialCrop={() => effectiveInitialAreaBounds() ?? CROP_ZERO}
 								showBounds={isValid()}
-								aspectRatio={aspect() ?? undefined}
-								snapToRatioEnabled={snapToRatioEnabled()}
+								aspectRatio={currentAspect() ?? undefined}
+								snapToRatioEnabled={currentSnapToRatio()}
 								onContextMenu={(e) => showCropOptionsMenu(e)}
 							/>
 						</div>
@@ -1186,7 +1523,11 @@ function CameraPreviewInline() {
 		createStore<CameraWindowState>(getDefaultCameraWindowState()),
 		{ name: CAMERA_WINDOW_STATE_STORAGE_KEY },
 	);
-	const [frame, setFrame] = createSignal<ImageData | null>(null);
+	const [hasFrame, setHasFrame] = createSignal(false);
+	const [frameDimensions, setFrameDimensions] = createSignal<{
+		width: number;
+		height: number;
+	} | null>(null);
 	const [connectionFailed, setConnectionFailed] = createSignal(false);
 	const [chromeVisible, setChromeVisible] = createSignal(false);
 	const [viewportSize, setViewportSize] = createSignal({
@@ -1194,18 +1535,53 @@ function CameraPreviewInline() {
 		height: window.innerHeight,
 	});
 	let canvasRef: HTMLCanvasElement | undefined;
-	let ws: WebSocket | undefined;
+	let ws: Omit<WebSocket, "onmessage"> | undefined;
+	let canvasControls: CanvasControls | undefined;
 	let retryCount = 0;
 	let reconnectTimeoutId: ReturnType<typeof setTimeout> | undefined;
 	let stallCheckInterval: ReturnType<typeof setInterval> | undefined;
 	let isCleanedUp = false;
-	let reusableFrame: ImageData | null = null;
-	let reusableFrameWidth = 0;
-	let reusableFrameHeight = 0;
 	let lastFrameTime = 0;
 
 	const cameraWsPort = window.__CAP__?.cameraWsPort;
 	const hasCameraSelected = () => rawOptions.cameraID !== null;
+
+	const closeSocket = () => {
+		const socket = ws;
+		const controls = canvasControls;
+		ws = undefined;
+		canvasControls = undefined;
+		controls?.dispose();
+		if (
+			socket &&
+			socket.readyState !== WebSocket.CLOSING &&
+			socket.readyState !== WebSocket.CLOSED
+		) {
+			socket.close();
+		}
+	};
+
+	const initCanvasControls = () => {
+		if (!canvasControls || !canvasRef) return;
+		canvasControls.initDirectCanvas(canvasRef);
+	};
+
+	const updateFrameState = (frame: FrameData) => {
+		resetBackoff();
+		lastFrameTime = Date.now();
+
+		const dimensions = frameDimensions();
+		if (
+			!dimensions ||
+			dimensions.width !== frame.width ||
+			dimensions.height !== frame.height
+		) {
+			setFrameDimensions({ width: frame.width, height: frame.height });
+		}
+		if (canvasControls?.hasRenderedFrame()) {
+			setHasFrame(true);
+		}
+	};
 
 	createEventListener(window, "resize", () => {
 		setViewportSize({
@@ -1236,55 +1612,6 @@ function CameraPreviewInline() {
 			background_blur: normalizeBackgroundBlurMode(state.backgroundBlur),
 		});
 	});
-
-	const getReusableFrame = (width: number, height: number) => {
-		if (
-			!reusableFrame ||
-			reusableFrameWidth !== width ||
-			reusableFrameHeight !== height
-		) {
-			reusableFrame = new ImageData(width, height);
-			reusableFrameWidth = width;
-			reusableFrameHeight = height;
-		}
-
-		return reusableFrame;
-	};
-
-	let pendingRender = false;
-	let rafId: number | null = null;
-	let cachedCtx: CanvasRenderingContext2D | null = null;
-	let latestImageData: ImageData | null = null;
-
-	const scheduleRender = () => {
-		if (rafId !== null) return;
-		rafId = requestAnimationFrame(() => {
-			rafId = null;
-			if (!pendingRender || !latestImageData) return;
-			pendingRender = false;
-
-			const canvas = canvasRef;
-			if (!canvas) return;
-			if (
-				canvas.width !== latestImageData.width ||
-				canvas.height !== latestImageData.height
-			) {
-				canvas.width = latestImageData.width;
-				canvas.height = latestImageData.height;
-				cachedCtx = null;
-			}
-			if (!cachedCtx) {
-				cachedCtx = canvas.getContext("2d");
-			}
-			cachedCtx?.putImageData(latestImageData, 0, 0);
-		});
-	};
-
-	const drawFrame = (image: ImageData) => {
-		latestImageData = image;
-		pendingRender = true;
-		scheduleRender();
-	};
 
 	const scheduleReconnect = () => {
 		if (isCleanedUp || reconnectTimeoutId !== undefined || ws) return;
@@ -1318,106 +1645,36 @@ function CameraPreviewInline() {
 		}
 	};
 
-	const cleanupSocket = (socket: WebSocket) => {
-		socket.onopen = null;
-		socket.onclose = null;
-		socket.onerror = null;
-		socket.onmessage = null;
-	};
-
 	const createSocket = () => {
 		if (!cameraWsPort) return undefined;
 
-		const socket = new WebSocket(`ws://localhost:${cameraWsPort}`);
-		socket.binaryType = "arraybuffer";
+		const [socket, _isConnected, _isWorkerReady, controls] = createImageDataWS(
+			`ws://localhost:${cameraWsPort}`,
+			updateFrameState,
+			() => commands.refreshCameraFeed().catch(() => {}),
+			{ powerPreference: "low-power" },
+		);
+		canvasControls = controls;
+		initCanvasControls();
 
-		socket.onopen = () => {
+		socket.addEventListener("open", () => {
 			setConnectionFailed(false);
 			lastFrameTime = Date.now();
-		};
+			setHasFrame(false);
+			setFrameDimensions(null);
+		});
 
-		socket.onclose = () => {
-			cleanupSocket(socket);
+		socket.addEventListener("close", () => {
+			if (canvasControls === controls) {
+				canvasControls = undefined;
+			}
 			if (ws === socket) ws = undefined;
 			if (!isCleanedUp && hasCameraSelected()) scheduleReconnect();
-		};
+		});
 
-		socket.onerror = () => {
-			socket.close();
-		};
-
-		socket.onmessage = (event) => {
-			resetBackoff();
-			lastFrameTime = Date.now();
-			if (pendingRender) return;
-
-			const buffer = event.data as ArrayBuffer;
-			const clamped = new Uint8ClampedArray(buffer);
-			if (clamped.length < 24) return;
-
-			const MAX_FRAME_DIMENSION = 8192;
-			const MAX_STRIDE_BYTES = MAX_FRAME_DIMENSION * 4 * 2;
-			const MAX_FRAME_SIZE = MAX_FRAME_DIMENSION * MAX_FRAME_DIMENSION * 4;
-
-			const metadataOffset = clamped.length - 24;
-			const meta = new DataView(buffer, metadataOffset, 24);
-			const strideBytes = meta.getUint32(0, true);
-			const height = meta.getUint32(4, true);
-			const width = meta.getUint32(8, true);
-
-			if (!width || !height || strideBytes === 0) return;
-
-			if (
-				width > MAX_FRAME_DIMENSION ||
-				height > MAX_FRAME_DIMENSION ||
-				strideBytes > MAX_STRIDE_BYTES
-			)
-				return;
-
-			const source = clamped.subarray(0, metadataOffset);
-			const expectedRowBytes = width * 4;
-			const availableLength = strideBytes * height;
-
-			if (
-				expectedRowBytes > MAX_STRIDE_BYTES ||
-				availableLength > MAX_FRAME_SIZE
-			)
-				return;
-
-			if (strideBytes < expectedRowBytes || source.length < availableLength)
-				return;
-
-			const expectedLength = expectedRowBytes * height;
-
-			if (expectedLength > MAX_FRAME_SIZE) return;
-
-			const imageData = getReusableFrame(width, height);
-
-			if (strideBytes === expectedRowBytes) {
-				imageData.data.set(source.subarray(0, expectedLength));
-			} else {
-				for (let row = 0; row < height; row += 1) {
-					const srcStart = row * strideBytes;
-					const destStart = row * expectedRowBytes;
-					imageData.data.set(
-						source.subarray(srcStart, srcStart + expectedRowBytes),
-						destStart,
-					);
-				}
-			}
-
-			drawFrame(imageData);
-
-			const currentFrame = frame();
-			if (
-				!currentFrame ||
-				currentFrame !== imageData ||
-				currentFrame.width !== imageData.width ||
-				currentFrame.height !== imageData.height
-			) {
-				setFrame(imageData);
-			}
-		};
+		socket.addEventListener("error", () => {
+			controls.dispose();
+		});
 
 		return socket;
 	};
@@ -1456,31 +1713,15 @@ function CameraPreviewInline() {
 				}
 			}, WS_STALL_TIMEOUT_MS);
 		} else {
-			if (
-				ws &&
-				ws.readyState !== WebSocket.CLOSING &&
-				ws.readyState !== WebSocket.CLOSED
-			) {
-				cleanupSocket(ws);
-				ws.close();
-			}
-			ws = undefined;
-			setFrame(null);
-			reusableFrame = null;
-			reusableFrameWidth = 0;
-			reusableFrameHeight = 0;
+			setHasFrame(false);
+			setFrameDimensions(null);
+			closeSocket();
 			setConnectionFailed(false);
 		}
 	});
 
 	onCleanup(() => {
 		isCleanedUp = true;
-		if (rafId !== null) {
-			cancelAnimationFrame(rafId);
-			rafId = null;
-		}
-		cachedCtx = null;
-		latestImageData = null;
 		if (reconnectTimeoutId !== undefined) {
 			clearTimeout(reconnectTimeoutId);
 			reconnectTimeoutId = undefined;
@@ -1489,22 +1730,15 @@ function CameraPreviewInline() {
 			clearInterval(stallCheckInterval);
 			stallCheckInterval = undefined;
 		}
-		reusableFrame = null;
-		reusableFrameWidth = 0;
-		reusableFrameHeight = 0;
-		if (ws) {
-			cleanupSocket(ws);
-			ws.close();
-			ws = undefined;
-		}
+		closeSocket();
 	});
 
 	const previewDimensions = () => {
-		const f = frame();
+		const dimensions = frameDimensions();
 		const { width, height } = cameraPreviewDimensions(
 			state.size,
 			state.shape,
-			f ? f.width / f.height : undefined,
+			dimensions ? dimensions.width / dimensions.height : undefined,
 		);
 		const viewport = viewportSize();
 		const maxWidth = Math.max(160, viewport.width - 48);
@@ -1530,27 +1764,15 @@ function CameraPreviewInline() {
 		return {
 			height: "100%",
 			"object-fit": "cover" as const,
+			opacity: hasFrame() ? "1" : "0",
 			transform: state.mirrored ? "scaleX(-1)" : "scaleX(1)",
 			width: "100%",
 		};
 	};
 
-	createEffect(() => {
-		const image = frame();
-		const canvas = canvasRef;
-		if (!image || !canvas) return;
-		if (canvas.width !== image.width || canvas.height !== image.height) {
-			canvas.width = image.width;
-			canvas.height = image.height;
-			cachedCtx = null;
-		}
-	});
-
 	const handleRetryConnection = () => {
 		resetBackoff();
-		if (ws) {
-			ws.close();
-		}
+		closeSocket();
 		ws = createSocket();
 	};
 
@@ -1571,7 +1793,7 @@ function CameraPreviewInline() {
 			</div>
 			<div class="relative shadow-lg" style={previewFrameStyle()}>
 				<div
-					class="flex items-center justify-center w-full h-full overflow-hidden border border-gray-6 bg-black text-gray-11"
+					class="flex items-center justify-center w-full h-full overflow-hidden border border-gray-6 bg-black text-gray-11 relative"
 					style={{ "border-radius": "inherit" }}
 				>
 					<Show
@@ -1600,13 +1822,16 @@ function CameraPreviewInline() {
 								</div>
 							}
 						>
-							<Show
-								when={frame()}
-								fallback={
-									<div class="text-sm text-gray-11">Loading camera...</div>
-								}
-							>
-								<canvas ref={canvasRef} style={canvasStyle()} />
+							<canvas
+								ref={(canvas) => {
+									canvasRef = canvas;
+									initCanvasControls();
+								}}
+								class="absolute inset-0"
+								style={canvasStyle()}
+							/>
+							<Show when={!hasFrame()}>
+								<div class="text-sm text-gray-11">Loading camera...</div>
 							</Show>
 						</Show>
 					</Show>
@@ -1765,14 +1990,18 @@ function RecordingControls(props: {
 	return (
 		<>
 			<div class="flex flex-col gap-2.5 items-stretch my-2.5 w-104 max-w-[90vw]">
-				<div class="p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/70 dark:bg-gray-2/70 shadow-lg backdrop-blur-xl">
+				<div class={`${LIQUID_GLASS_SURFACE_CLASS} p-3`}>
 					<div class="flex gap-2.5 items-center">
 						<div
 							onClick={() => {
 								if (props.onClose) {
 									props.onClose();
 								} else {
-									setOptions("targetMode", null);
+									setOptions({
+										targetMode: null,
+										targetModeDismissal: "cancelled",
+									});
+									commands.setEditorRecordingTarget(null);
 									commands.closeTargetSelectOverlays();
 								}
 							}}
@@ -1791,20 +2020,27 @@ function RecordingControls(props: {
 								}
 								if (startDisabled()) return;
 
-								if (props.target.variant === "area") {
+								// Snapshot before onRecordingStart: dismissing the picker
+								// (targetMode: null) disposes the <Match> branch that owns
+								// this component, and the display/area target props call its
+								// narrowed accessor — reading props.target afterwards throws
+								// "Stale read from <Match>." and the recording never starts.
+								const target = props.target;
+
+								if (target.variant === "area") {
 									setOptions(
 										"captureTarget",
 										reconcile({
 											variant: "area",
-											screen: props.target.screen,
+											screen: target.screen,
 											bounds: {
 												position: {
-													x: props.target.bounds.position.x,
-													y: props.target.bounds.position.y,
+													x: target.bounds.position.x,
+													y: target.bounds.position.y,
 												},
 												size: {
-													width: props.target.bounds.size.width,
-													height: props.target.bounds.size.height,
+													width: target.bounds.size.width,
+													height: target.bounds.size.height,
 												},
 											},
 										}),
@@ -1823,10 +2059,14 @@ function RecordingControls(props: {
 											}
 										}
 
-										const path = await invoke<string>("take_screenshot", {
-											target: props.target,
-										});
-										await commands.showWindow({ ScreenshotEditor: { path } });
+										const path = await commands.takeScreenshot(target);
+										const shouldOpenEditor =
+											await commands.automationShouldOpenScreenshotEditor(
+												target,
+											);
+										if (shouldOpenEditor) {
+											await commands.showWindow({ ScreenshotEditor: { path } });
+										}
 										await commands.closeTargetSelectOverlays();
 									} catch (e) {
 										const message = e instanceof Error ? e.message : String(e);
@@ -1836,11 +2076,44 @@ function RecordingControls(props: {
 									return;
 								}
 
-								commands.startRecording({
-									capture_target: props.target,
-									mode: rawOptions.mode,
-									capture_system_audio: rawOptions.captureSystemAudio,
-								});
+								commands
+									.startRecording({
+										capture_target: target,
+										mode: rawOptions.mode,
+										capture_system_audio: rawOptions.captureSystemAudio,
+									})
+									.then((action) => {
+										// On success the backend closes the overlay windows; the
+										// non-Started actions leave our hidden windows behind.
+										// User-facing feedback for them arrives via the backend's
+										// StartFailed event in the main window.
+										if (action !== "Started")
+											void commands.closeTargetSelectOverlays();
+									})
+									.catch((e: unknown) => {
+										const msg = e instanceof Error ? e.message : String(e);
+										// This webview is hidden by now, so the toast is a
+										// best-effort extra — the visible feedback comes from the
+										// backend's StartFailed event toasted in the main window.
+										if (
+											msg.includes("no longer available") ||
+											msg.includes("DeviceNotFound")
+										) {
+											toast.error(
+												"Selected microphone is not available. Please select a different microphone in settings.",
+											);
+										} else {
+											toast.error(`Failed to start recording: ${msg}`);
+										}
+										// An IPC-level rejection never reaches the backend, so no
+										// StartFailed event fires; the picker flow hid the main
+										// window and dismissal closed the overlays — without this,
+										// the whole app visually vanishes with no recording.
+										void commands.showWindow({
+											Main: { init_target_mode: null },
+										});
+										void commands.closeTargetSelectOverlays();
+									});
 							}}
 						>
 							<div
@@ -1894,7 +2167,7 @@ function RecordingControls(props: {
 					</div>
 				</div>
 				<Show when={(rawOptions.mode as string) !== "screenshot"}>
-					<div class="p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/70 dark:bg-gray-2/70 shadow-lg backdrop-blur-xl">
+					<div class={`${LIQUID_GLASS_SURFACE_CLASS} p-3`}>
 						<div class="grid grid-cols-2 gap-2 w-full">
 							<CameraSelectBase
 								disabled={devices.isPending}

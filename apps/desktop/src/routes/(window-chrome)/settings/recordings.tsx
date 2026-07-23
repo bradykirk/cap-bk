@@ -233,7 +233,7 @@ export default function Recordings() {
 												"flex gap-1.5 items-center transition-colors duration-200 p-2 px-3 border rounded-full",
 												activeTab() === tab.id
 													? "bg-gray-5 cursor-default border-gray-5"
-													: "bg-transparent cursor-pointer hover:bg-gray-3 border-gray-5",
+													: "bg-transparent hover:bg-gray-3 border-gray-5",
 											)}
 											onClick={() => setActiveTab(tab.id)}
 										>
@@ -346,9 +346,7 @@ function RecordingItem(props: {
 			}}
 			class={cx(
 				"flex flex-row justify-between p-3 not-last:border-b not-last:border-gray-3 items-center w-full  transition-colors duration-200",
-				studioCompleteCheck()
-					? "cursor-pointer hover:bg-gray-3"
-					: "cursor-default",
+				studioCompleteCheck() ? "hover:bg-gray-3" : "cursor-default",
 			)}
 		>
 			<div class="flex gap-5 items-center">
@@ -381,6 +379,12 @@ function RecordingItem(props: {
 							)}
 							<p>{firstLetterUpperCase()}</p>
 						</div>
+
+						<Show when={props.recording.meta.clip_count > 1}>
+							<div class="px-2 py-0.5 flex items-center font-medium text-[11px] text-gray-12 rounded-full w-fit bg-gray-4">
+								<p>{props.recording.meta.clip_count} clips</p>
+							</div>
+						</Show>
 
 						<Show when={props.recording.meta.status.status === "InProgress"}>
 							<div

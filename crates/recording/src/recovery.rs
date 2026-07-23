@@ -6,8 +6,8 @@ use std::{
 use cap_enc_ffmpeg::fragmented_mp4::tail_is_complete;
 use cap_enc_ffmpeg::remux::{
     concatenate_audio_to_ogg, concatenate_m4s_segments_with_init, concatenate_video_fragments,
-    get_media_duration, get_video_fps, probe_media_valid, probe_video_can_decode,
-    probe_video_seek_points, remux_file,
+    get_media_duration, get_video_fps, merge_video_audio, probe_media_valid,
+    probe_video_can_decode, probe_video_seek_points, remux_file,
 };
 use cap_project::{
     AudioMeta, Cursors, MultipleSegment, MultipleSegments, ProjectConfiguration, RecordingMeta,
@@ -15,9 +15,15 @@ use cap_project::{
     TimelineSegment, VideoMeta,
 };
 use relative_path::RelativePathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::output_pipeline::{HealthSender, PipelineHealthEvent, emit_health};
+
+macro_rules! finalization_info {
+    ($($arg:tt)*) => {
+        tracing::info!(target: "cap_recording::recording_finalization", $($arg)*)
+    };
+}
 
 #[derive(Debug, Clone)]
 pub struct IncompleteRecording {
@@ -51,6 +57,35 @@ struct FragmentsInfo {
     init_segment: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecoveryPurpose {
+    Recover,
+    Finalize,
+}
+
+impl RecoveryPurpose {
+    fn success_message(self) -> &'static str {
+        match self {
+            Self::Recover => "Successfully recovered recording",
+            Self::Finalize => "Successfully finalized fragmented recording",
+        }
+    }
+
+    fn timeline_message(self) -> &'static str {
+        match self {
+            Self::Recover => "Created project configuration with timeline for recovered recording",
+            Self::Finalize => "Created project configuration with timeline for finalized recording",
+        }
+    }
+
+    fn track_action(self) -> &'static str {
+        match self {
+            Self::Recover => "recovery",
+            Self::Finalize => "finalization",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
     #[error("IO error: {0}")]
@@ -59,6 +94,8 @@ pub enum RecoveryError {
     VideoConcat(cap_enc_ffmpeg::remux::RemuxError),
     #[error("Failed to concatenate audio fragments: {0}")]
     AudioConcat(cap_enc_ffmpeg::remux::RemuxError),
+    #[error("Failed to merge media streams: {0}")]
+    MediaMerge(cap_enc_ffmpeg::remux::RemuxError),
     #[error("Failed to serialize meta: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("No recoverable segments found")]
@@ -108,6 +145,19 @@ impl RecoveryManager {
         }
     }
 
+    pub fn remux_if_needed(project_path: &Path) -> Result<bool, RecoveryError> {
+        let Some(incomplete) = Self::find_incomplete_single(project_path) else {
+            return Ok(false);
+        };
+
+        if incomplete.recoverable_segments.is_empty() {
+            return Ok(false);
+        }
+
+        Self::finalize(&incomplete)?;
+        Ok(true)
+    }
+
     pub fn find_incomplete(recordings_dir: &Path) -> Vec<IncompleteRecording> {
         let mut incomplete = Vec::new();
 
@@ -149,8 +199,7 @@ impl RecoveryManager {
     fn should_check_for_recovery(status: &StudioRecordingStatus) -> bool {
         match status {
             StudioRecordingStatus::InProgress | StudioRecordingStatus::NeedsRemux => true,
-            StudioRecordingStatus::Failed { error } => error != "No recoverable segments found",
-            StudioRecordingStatus::Complete => false,
+            StudioRecordingStatus::Failed { .. } | StudioRecordingStatus::Complete => false,
         }
     }
 
@@ -248,12 +297,12 @@ impl RecoveryManager {
         }
 
         if recoverable_segments.is_empty() {
-            info!("No recoverable segments found in {:?}", project_path);
+            finalization_info!("No fragmented segments found in {:?}", project_path);
             return None;
         }
 
-        info!(
-            "Found {} recoverable segments in {:?} with estimated duration {:?}",
+        finalization_info!(
+            "Found {} fragmented segments in {:?} with estimated duration {:?}",
             recoverable_segments.len(),
             project_path,
             total_duration
@@ -484,7 +533,7 @@ impl RecoveryManager {
 
             indexed.sort_by_key(|(idx, _)| *idx);
 
-            info!(
+            finalization_info!(
                 "Including {} fragments from respawn-{} at {}",
                 indexed.len(),
                 n,
@@ -567,7 +616,7 @@ impl RecoveryManager {
             }
             match std::fs::rename(&path, &final_path) {
                 Ok(()) => {
-                    info!(
+                    finalization_info!(
                         "Rescued in-progress tmp fragment: {} -> {} ({} bytes)",
                         path.display(),
                         final_path.display(),
@@ -708,7 +757,40 @@ impl RecoveryManager {
         if total.is_zero() { None } else { Some(total) }
     }
 
+    /// Reads the display media duration the recorder persisted into the
+    /// project's default timeline, used to cross-check the remuxed container.
+    fn expected_display_duration_from_config(
+        project_path: &Path,
+        segment_index: u32,
+    ) -> Option<std::time::Duration> {
+        let config = std::fs::read_to_string(project_path.join("project-config.json")).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&config).ok()?;
+        let segments = value.get("timeline")?.get("segments")?.as_array()?;
+        let segment = segments.iter().find(|s| {
+            s.get("recordingSegment")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(segment_index))
+        })?;
+        let end = segment.get("end")?.as_f64()?;
+        let start = segment
+            .get("start")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        (end > start && end.is_finite()).then(|| std::time::Duration::from_secs_f64(end - start))
+    }
+
     pub fn recover(recording: &IncompleteRecording) -> Result<RecoveredRecording, RecoveryError> {
+        Self::finalize_with_purpose(recording, RecoveryPurpose::Recover)
+    }
+
+    pub fn finalize(recording: &IncompleteRecording) -> Result<RecoveredRecording, RecoveryError> {
+        Self::finalize_with_purpose(recording, RecoveryPurpose::Finalize)
+    }
+
+    fn finalize_with_purpose(
+        recording: &IncompleteRecording,
+        purpose: RecoveryPurpose,
+    ) -> Result<RecoveredRecording, RecoveryError> {
         if recording.recoverable_segments.is_empty() {
             return Err(RecoveryError::NoRecoverableSegments);
         }
@@ -725,7 +807,7 @@ impl RecoveryManager {
             if segment.display_fragments.len() == 1 && segment.display_init_segment.is_none() {
                 let source = &segment.display_fragments[0];
                 if source != &display_output {
-                    info!("Moving single display fragment to {:?}", display_output);
+                    finalization_info!("Moving single display fragment to {:?}", display_output);
                     std::fs::rename(source, &display_output)?;
                 }
                 Self::validate_required_video(&display_output, "display")?;
@@ -768,6 +850,17 @@ impl RecoveryManager {
                 }
             }
 
+            // Sync invariant: the remuxed display track must match the media
+            // span the recorder persisted from its capture timestamps.
+            if display_output.is_file()
+                && let Some(expected) = Self::expected_display_duration_from_config(
+                    &recording.project_path,
+                    segment.index,
+                )
+            {
+                crate::output_validation::check_display_sync_span(&display_output, expected);
+            }
+
             if let Some(camera_frags) = &segment.camera_fragments {
                 let camera_output = segment_dir.join("camera.mp4");
                 let camera_dir = segment_dir.join("camera");
@@ -775,7 +868,7 @@ impl RecoveryManager {
                 if camera_frags.len() == 1 && segment.camera_init_segment.is_none() {
                     let source = &camera_frags[0];
                     if source != &camera_output {
-                        info!("Moving single camera fragment to {:?}", camera_output);
+                        finalization_info!("Moving single camera fragment to {:?}", camera_output);
                         std::fs::rename(source, &camera_output)?;
                     }
                     match Self::validate_required_video(&camera_output, "camera") {
@@ -809,7 +902,8 @@ impl RecoveryManager {
                         Ok(()) => true,
                         Err(err) => {
                             warn!(
-                                "Camera track recovery failed for {:?}: {err}. Preserving fragments for retry.",
+                                "Camera track {} failed for {:?}: {err}. Preserving fragments for retry.",
+                                purpose.track_action(),
                                 camera_output
                             );
                             if let Err(e) = std::fs::remove_file(&camera_output)
@@ -851,10 +945,13 @@ impl RecoveryManager {
                     let is_ogg = source.extension().map(|e| e == "ogg").unwrap_or(false);
                     if source != &mic_output {
                         if is_ogg {
-                            info!("Moving single mic fragment to {:?}", mic_output);
+                            finalization_info!("Moving single mic fragment to {:?}", mic_output);
                             std::fs::rename(source, &mic_output)?;
                         } else {
-                            info!("Transcoding single mic fragment to {:?}", mic_output);
+                            finalization_info!(
+                                "Transcoding single mic fragment to {:?}",
+                                mic_output
+                            );
                             concatenate_audio_to_ogg(mic_frags, &mic_output)
                                 .map_err(RecoveryError::AudioConcat)?;
                             if let Err(e) = std::fs::remove_file(source) {
@@ -869,7 +966,7 @@ impl RecoveryManager {
                         }
                     }
                 } else if mic_frags.len() > 1 {
-                    info!(
+                    finalization_info!(
                         "Concatenating {} mic fragments to {:?}",
                         mic_frags.len(),
                         mic_output
@@ -898,10 +995,13 @@ impl RecoveryManager {
                     let is_ogg = source.extension().map(|e| e == "ogg").unwrap_or(false);
                     if source != &system_output {
                         if is_ogg {
-                            info!("Moving single system audio fragment to {:?}", system_output);
+                            finalization_info!(
+                                "Moving single system audio fragment to {:?}",
+                                system_output
+                            );
                             std::fs::rename(source, &system_output)?;
                         } else {
-                            info!(
+                            finalization_info!(
                                 "Transcoding single system audio fragment to {:?}",
                                 system_output
                             );
@@ -919,7 +1019,7 @@ impl RecoveryManager {
                         }
                     }
                 } else if system_frags.len() > 1 {
-                    info!(
+                    finalization_info!(
                         "Concatenating {} system audio fragments to {:?}",
                         system_frags.len(),
                         system_output
@@ -950,10 +1050,11 @@ impl RecoveryManager {
             .save_for_project()
             .map_err(|_| RecoveryError::MetaSave)?;
 
-        Self::create_project_config(recording, &meta)?;
+        Self::create_project_config(recording, &meta, purpose)?;
 
-        info!(
-            "Successfully recovered recording at {:?}",
+        finalization_info!(
+            "{} at {:?}",
+            purpose.success_message(),
             recording.project_path
         );
 
@@ -968,6 +1069,55 @@ impl RecoveryManager {
         output: &Path,
     ) -> Result<PathBuf, RecoveryError> {
         Self::finalize_to_progressive_mp4_with_health(fragmented_dir, output, None)
+    }
+
+    pub fn finalize_instant_output(
+        display_dir: &Path,
+        audio_dir: &Path,
+        output: &Path,
+    ) -> Result<PathBuf, RecoveryError> {
+        if !audio_dir.exists() {
+            return Self::finalize_to_progressive_mp4(display_dir, output);
+        }
+
+        Self::rescue_pending_tmp_fragments(audio_dir, None);
+        let audio_info = Self::find_complete_fragments_with_init(audio_dir);
+        if audio_info.fragments.is_empty() {
+            return Self::finalize_to_progressive_mp4(display_dir, output);
+        }
+
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let stem = output
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("instant");
+        let video_output = parent.join(format!("{stem}.video.mp4"));
+        let audio_output = parent.join(format!("{stem}.audio.mp4"));
+        let merged_output = parent.join(format!("{stem}.merged.mp4"));
+
+        let result = (|| {
+            Self::finalize_to_progressive_mp4(display_dir, &video_output)?;
+            Self::finalize_audio_fragments_to_progressive_mp4(
+                &audio_info.fragments,
+                audio_info.init_segment.as_deref(),
+                &audio_output,
+                "audio",
+            )?;
+            merge_video_audio(&video_output, &audio_output, &merged_output)
+                .map_err(RecoveryError::MediaMerge)?;
+            Self::validate_required_video(&merged_output, "display")?;
+            replace_file(&merged_output, output)?;
+            Ok(output.to_path_buf())
+        })();
+
+        for path in [&video_output, &audio_output, &merged_output] {
+            if path.exists() && path != output {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        result
     }
 
     pub fn finalize_to_progressive_mp4_with_health(
@@ -1063,7 +1213,7 @@ impl RecoveryManager {
         }
 
         if let Some(init_path) = init_segment {
-            info!(
+            finalization_info!(
                 "Concatenating {} M4S {label} segments with init to {:?}",
                 fragments.len(),
                 output
@@ -1071,7 +1221,7 @@ impl RecoveryManager {
             concatenate_m4s_segments_with_init(init_path, fragments, output)
                 .map_err(RecoveryError::VideoConcat)?;
         } else {
-            info!(
+            finalization_info!(
                 "Concatenating {} {label} fragments to {:?}",
                 fragments.len(),
                 output
@@ -1083,15 +1233,46 @@ impl RecoveryManager {
         Ok(())
     }
 
+    fn finalize_audio_fragments_to_progressive_mp4(
+        fragments: &[PathBuf],
+        init_segment: Option<&Path>,
+        output: &Path,
+        label: &str,
+    ) -> Result<(), RecoveryError> {
+        if fragments.is_empty() {
+            return Err(RecoveryError::NoRecoverableSegments);
+        }
+
+        if let Some(init_path) = init_segment {
+            finalization_info!(
+                "Concatenating {} M4S {label} segments with init to {:?}",
+                fragments.len(),
+                output
+            );
+            concatenate_m4s_segments_with_init(init_path, fragments, output)
+                .map_err(RecoveryError::AudioConcat)?;
+        } else {
+            finalization_info!(
+                "Concatenating {} {label} fragments to {:?}",
+                fragments.len(),
+                output
+            );
+            concatenate_video_fragments(fragments, output).map_err(RecoveryError::AudioConcat)?;
+        }
+
+        Ok(())
+    }
+
     fn validate_required_video(path: &Path, label: &str) -> Result<(), RecoveryError> {
-        info!("Validating recovered {} video: {:?}", label, path);
+        finalization_info!("Validating finalized {} video: {:?}", label, path);
 
         Self::ensure_video_decodes(path, label)?;
 
         if let Err(seek_error) = probe_video_seek_points(path, EXPORT_SEEK_PROBE_SAMPLE_COUNT) {
-            info!(
-                "Recovered {} video failed seek validation, normalizing via remux: {}",
-                label, seek_error
+            finalization_info!(
+                "Finalized {} video failed seek validation, normalizing via remux: {}",
+                label,
+                seek_error
             );
             Self::normalize_recovered_video(path, label)?;
         }
@@ -1126,8 +1307,8 @@ impl RecoveryManager {
             ))
         })?;
 
-        info!(
-            "Recovered {} video validation passed after normalization",
+        finalization_info!(
+            "Finalized {} video validation passed after normalization",
             label
         );
 
@@ -1217,6 +1398,7 @@ impl RecoveryManager {
                                 device_id: original_segment
                                     .and_then(|s| s.mic.as_ref())
                                     .and_then(|m| m.device_id.clone()),
+                                gap_summary: None,
                             })
                         } else {
                             None
@@ -1240,6 +1422,7 @@ impl RecoveryManager {
                                 device_id: original_segment
                                     .and_then(|s| s.system_audio.as_ref())
                                     .and_then(|a| a.device_id.clone()),
+                                gap_summary: None,
                             })
                         } else {
                             None
@@ -1278,6 +1461,7 @@ impl RecoveryManager {
     fn create_project_config(
         recording: &IncompleteRecording,
         meta: &StudioRecordingMeta,
+        purpose: RecoveryPurpose,
     ) -> Result<(), RecoveryError> {
         let StudioRecordingMeta::MultipleSegments { inner, .. } = meta else {
             return Ok(());
@@ -1311,6 +1495,8 @@ impl RecoveryManager {
                     start: 0.0,
                     end: duration,
                     timescale: 1.0,
+                    name: None,
+                    speed_audio_mode: None,
                 })
             })
             .collect();
@@ -1324,19 +1510,21 @@ impl RecoveryManager {
 
         config.timeline = Some(TimelineConfiguration {
             segments: timeline_segments,
+            transitions: Vec::new(),
             zoom_segments: Vec::new(),
             scene_segments: Vec::new(),
             mask_segments: Vec::new(),
             text_segments: Vec::new(),
             caption_segments: Vec::new(),
             keyboard_segments: Vec::new(),
+            audio_segments: Vec::new(),
         });
 
         config
             .write(&recording.project_path)
             .map_err(RecoveryError::Io)?;
 
-        info!("Created project configuration with timeline for recovered recording");
+        finalization_info!("{}", purpose.timeline_message());
 
         Ok(())
     }
@@ -1382,8 +1570,8 @@ impl RecoveryManager {
                     },
                 );
 
-                info!(
-                    "Recovered cursor {} from image file: {:?}",
+                finalization_info!(
+                    "Loaded cursor {} from image file: {:?}",
                     id_str,
                     path.file_name()
                 );
@@ -1426,6 +1614,14 @@ impl RecoveryManager {
         let status_updated = match &mut updated_meta.inner {
             RecordingMetaInner::Studio(studio) => {
                 if let StudioRecordingMeta::MultipleSegments { inner, .. } = studio.as_mut() {
+                    if matches!(inner.status, Some(StudioRecordingStatus::Failed { .. })) {
+                        debug!(
+                            "Recording already failed before startup cleanup, preserving original status: {:?}",
+                            project_path
+                        );
+                        return;
+                    }
+
                     inner.status = Some(StudioRecordingStatus::Failed {
                         error: "No recoverable segments found".to_string(),
                     });
@@ -1444,8 +1640,8 @@ impl RecoveryManager {
                     project_path, e
                 );
             } else {
-                info!(
-                    "Marked recording as unrecoverable (no recoverable segments): {:?}",
+                debug!(
+                    "Marked stale recording as failed because no media fragments were present: {:?}",
                     project_path
                 );
             }

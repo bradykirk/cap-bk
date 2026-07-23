@@ -9,17 +9,18 @@ import {
 	users,
 } from "@cap/database/schema";
 import { buildEnv, serverEnv } from "@cap/env";
-import { stripe, userIsPro } from "@cap/utils";
+import { STRIPE_AVAILABLE, stripe, userIsPro } from "@cap/utils";
 import { OrganizationBrandingPatchBody } from "@cap/web-api-contract";
 import { ImageUploads } from "@cap/web-backend";
 import { type ImageUpload, Organisation } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { type Context, Hono } from "hono";
 import { PostHog } from "posthog-node";
 import type Stripe from "stripe";
 import { z } from "zod";
+import { getCheckoutRedirectUrls } from "@/lib/mobile-checkout";
 import { runPromise } from "@/lib/server";
 import { withAuth, withOptionalAuth } from "../../utils";
 import {
@@ -127,6 +128,18 @@ async function toDesktopOrganizations(
 	);
 }
 
+function mergeDesktopOrganizationRows(...rowSets: DesktopOrganizationRow[][]) {
+	const rowsById = new Map<string, DesktopOrganizationRow>();
+
+	for (const rows of rowSets) {
+		for (const row of rows) {
+			rowsById.set(row.id, row);
+		}
+	}
+
+	return Array.from(rowsById.values());
+}
+
 async function applyOrganizationLogoUpdate(
 	row: DesktopOrganizationRow,
 	logo: ReturnType<typeof decodeOrganizationLogoUpdate>,
@@ -171,6 +184,7 @@ const diagnosticsSchema = z.object({
 				})
 				.optional(),
 			macosVersion: z.object({ displayName: z.string() }).optional(),
+			linuxVersion: z.object({ displayName: z.string() }).optional(),
 			gpuInfo: z
 				.object({
 					vendor: z.string(),
@@ -229,6 +243,8 @@ function formatDiagnosticsForDiscord(
 		lines.push(`**OS:** ${sys.windowsVersion.displayName}`);
 	} else if (sys?.macosVersion?.displayName) {
 		lines.push(`**OS:** ${sys.macosVersion.displayName}`);
+	} else if (sys?.linuxVersion?.displayName) {
+		lines.push(`**OS:** ${sys.linuxVersion.displayName}`);
 	}
 
 	if (sys?.gpuInfo) {
@@ -392,7 +408,7 @@ app.post(
 		"form",
 		z.object({
 			feedback: z.string(),
-			os: z.union([z.literal("macos"), z.literal("windows")]).optional(),
+			os: z.enum(["macos", "windows", "linux"]).optional(),
 			version: z.string().optional(),
 		}),
 	),
@@ -526,33 +542,54 @@ app.get("/user/profile/image", async (c) => {
 app.get("/organizations", withAuth, async (c) => {
 	const user = c.get("user");
 
-	const rows = await db()
-		.select({
-			id: organizations.id,
-			name: organizations.name,
-			ownerId: organizations.ownerId,
-			tombstoneAt: organizations.tombstoneAt,
-			iconUrl: organizations.iconUrl,
-			metadata: organizations.metadata,
-			role: organizationMembers.role,
-		})
-		.from(organizations)
-		.leftJoin(
-			organizationMembers,
-			and(
-				eq(organizationMembers.organizationId, organizations.id),
-				eq(organizationMembers.userId, user.id),
-			),
-		)
-		.where(
-			and(
-				isNull(organizations.tombstoneAt),
-				or(
-					eq(organizations.ownerId, user.id),
+	const [ownedRows, memberRows] = await Promise.all([
+		db()
+			.select({
+				id: organizations.id,
+				name: organizations.name,
+				ownerId: organizations.ownerId,
+				tombstoneAt: organizations.tombstoneAt,
+				iconUrl: organizations.iconUrl,
+				metadata: organizations.metadata,
+				role: organizationMembers.role,
+			})
+			.from(organizations)
+			.leftJoin(
+				organizationMembers,
+				and(
+					eq(organizationMembers.organizationId, organizations.id),
 					eq(organizationMembers.userId, user.id),
 				),
+			)
+			.where(
+				and(
+					isNull(organizations.tombstoneAt),
+					eq(organizations.ownerId, user.id),
+				),
 			),
-		);
+		db()
+			.select({
+				id: organizations.id,
+				name: organizations.name,
+				ownerId: organizations.ownerId,
+				tombstoneAt: organizations.tombstoneAt,
+				iconUrl: organizations.iconUrl,
+				metadata: organizations.metadata,
+				role: organizationMembers.role,
+			})
+			.from(organizationMembers)
+			.innerJoin(
+				organizations,
+				eq(organizations.id, organizationMembers.organizationId),
+			)
+			.where(
+				and(
+					eq(organizationMembers.userId, user.id),
+					isNull(organizations.tombstoneAt),
+				),
+			),
+	]);
+	const rows = mergeDesktopOrganizationRows(ownedRows, memberRows);
 
 	return c.json(await toDesktopOrganizations(rows, user.id));
 });
@@ -660,14 +697,35 @@ app.patch(
 app.post(
 	"/subscribe",
 	withAuth,
-	zValidator("json", z.object({ priceId: z.string() })),
+	zValidator(
+		"json",
+		z.object({
+			priceId: z.string(),
+			platform: z.literal("mobile").optional(),
+		}),
+	),
 	async (c) => {
-		const { priceId } = c.req.valid("json");
+		const { priceId, platform } = c.req.valid("json");
 		const user = c.get("user");
+		const checkoutPlatform = platform ?? "desktop";
 
 		if (userIsPro(user)) {
 			console.log("[POST] Error: User already on Pro plan");
 			return c.json({ error: true, subscription: true }, { status: 400 });
+		}
+
+		if (!STRIPE_AVAILABLE()) {
+			console.error(
+				JSON.stringify({
+					level: "error",
+					message: "Stripe checkout is not configured",
+					route: "/api/desktop/subscribe",
+				}),
+			);
+			return c.json(
+				{ code: "billing_unavailable", error: true },
+				{ status: 503 },
+			);
 		}
 
 		let customerId = user.stripeCustomerId;
@@ -713,14 +771,18 @@ app.post(
 		}
 
 		console.log("[POST] Creating checkout session");
+		const redirects = getCheckoutRedirectUrls(
+			checkoutPlatform,
+			serverEnv().WEB_URL,
+		);
 		const checkoutSession = await stripe().checkout.sessions.create({
 			customer: customerId as string,
 			line_items: [{ price: priceId, quantity: 1 }],
 			mode: "subscription",
-			success_url: `${serverEnv().WEB_URL}/dashboard/caps?upgrade=true`,
-			cancel_url: `${serverEnv().WEB_URL}/pricing`,
+			success_url: redirects.successUrl,
+			cancel_url: redirects.cancelUrl,
 			allow_promotion_codes: true,
-			metadata: { platform: "desktop", dubCustomerId: user.id },
+			metadata: { platform: checkoutPlatform, dubCustomerId: user.id },
 		});
 
 		if (checkoutSession.url) {
@@ -737,7 +799,7 @@ app.post(
 					properties: {
 						price_id: priceId,
 						quantity: 1,
-						platform: "desktop",
+						platform: checkoutPlatform,
 					},
 				});
 

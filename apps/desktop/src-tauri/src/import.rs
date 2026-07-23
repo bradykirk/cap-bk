@@ -18,7 +18,7 @@ use ffmpeg::{
 };
 use image::ImageEncoder;
 use relative_path::{Component as RelativeComponent, RelativePathBuf};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::{
     collections::HashMap,
@@ -43,7 +43,7 @@ const KEYBOARD_IMPORT_EXTENSIONS: &[&str] = &["bin", "json"];
 const CURSOR_EVENTS_IMPORT_EXTENSIONS: &[&str] = &["json"];
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 
-#[derive(Serialize, Type, Clone, Debug)]
+#[derive(Serialize, Deserialize, Type, Clone, Debug)]
 pub enum ImportStage {
     Probing,
     Converting,
@@ -52,7 +52,7 @@ pub enum ImportStage {
     Failed,
 }
 
-#[derive(Serialize, Type, tauri_specta::Event, Clone, Debug)]
+#[derive(Serialize, Deserialize, Type, tauri_specta::Event, Clone, Debug)]
 pub struct VideoImportProgress {
     pub project_path: String,
     pub stage: ImportStage,
@@ -321,6 +321,8 @@ fn full_timeline_for_segments(
                 timescale: 1.0,
                 start: 0.0,
                 end: duration,
+                name: None,
+                speed_audio_mode: None,
             })
         })
         .collect()
@@ -353,6 +355,8 @@ fn full_timeline_for_source_segments(
                 timescale: 1.0,
                 start: 0.0,
                 end: duration,
+                name: None,
+                speed_audio_mode: None,
             })
         })
         .collect()
@@ -366,12 +370,14 @@ fn ensure_project_timeline<'a>(
     if config.timeline.is_none() {
         config.timeline = Some(TimelineConfiguration {
             segments: full_timeline_for_segments(project_path, segments)?,
+            transitions: Vec::new(),
             zoom_segments: Vec::new(),
             scene_segments: Vec::new(),
             mask_segments: Vec::new(),
             text_segments: Vec::new(),
             caption_segments: Vec::new(),
             keyboard_segments: Vec::new(),
+            audio_segments: Vec::new(),
         });
     }
 
@@ -392,8 +398,13 @@ fn add_clip_configs(
 
         if let Some(existing) = config.clips.iter_mut().find(|clip| clip.index == index) {
             existing.offsets = offsets;
+            existing.offsets_auto_calculated = true;
         } else {
-            config.clips.push(ClipConfiguration { index, offsets });
+            config.clips.push(ClipConfiguration {
+                index,
+                offsets,
+                offsets_auto_calculated: true,
+            });
         }
     }
 }
@@ -904,6 +915,8 @@ fn source_timeline_segments_for_import(
             },
             start,
             end,
+            name: None,
+            speed_audio_mode: None,
         });
     }
 
@@ -1344,11 +1357,7 @@ fn transcode_video(
 pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<PathBuf, String> {
     info!("Starting video import from: {:?}", source_path);
 
-    let recordings_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("recordings");
+    let recordings_dir = crate::general_settings::GeneralSettingsStore::recordings_dir(&app);
 
     let project_name = generate_project_name(&source_path);
     let sanitized_name = sanitize_filename(&project_name);
@@ -1483,6 +1492,7 @@ pub async fn start_video_import(app: AppHandle, source_path: PathBuf) -> Result<
                             path: RelativePathBuf::from("content/segments/segment-0/audio.ogg"),
                             start_time: Some(0.0),
                             device_id: None,
+                            gap_summary: None,
                         })
                     } else {
                         None
@@ -1666,6 +1676,7 @@ async fn append_mp4_to_editor_project(
             path: output_audio_relative_path,
             start_time: Some(0.0),
             device_id: None,
+            gap_summary: None,
         })
     } else {
         None
@@ -1698,6 +1709,8 @@ async fn append_mp4_to_editor_project(
             timescale: 1.0,
             start: 0.0,
             end: duration,
+            name: None,
+            speed_audio_mode: None,
         });
     add_clip_configs(
         &mut config,
@@ -1827,6 +1840,8 @@ async fn append_cap_project_to_editor_project(
                 timescale: source_segment.timescale,
                 start: source_segment.start,
                 end: source_segment.end,
+                name: None,
+                speed_audio_mode: source_segment.speed_audio_mode,
             });
         }
     }
@@ -1859,6 +1874,7 @@ pub async fn add_existing_recording_to_editor(
     let imported_count = if is_mp4_import_path(&source_path) {
         append_mp4_to_editor_project(app, target_project_path, source_path).await?
     } else if is_cap_project_path(&source_path) {
+        crate::wait_for_recording_ready(&app, &source_path).await?;
         append_cap_project_to_editor_project(app, target_project_path, source_path).await?
     } else {
         return Err("Select an MP4 file or a Cap project folder".to_string());

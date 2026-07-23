@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { serverEnv } from "@cap/env";
 import { Storage, type User, type Video } from "@cap/web-domain";
-import { Effect, Option, Schedule } from "effect";
+import { Effect, Either, Option, Schedule } from "effect";
 import type {
 	GoogleDriveAccessTokenCache,
 	GoogleDriveIntegrationConfig,
@@ -82,6 +82,14 @@ export type CreateGoogleDriveUploadInput = {
 const normalizeContentType = (contentType?: string | null) =>
 	contentType?.trim() ? contentType : "application/octet-stream";
 
+const getGoogleDriveBrowserUploadOrigin = () => {
+	try {
+		return new URL(serverEnv().WEB_URL).origin;
+	} catch {
+		return null;
+	}
+};
+
 const appendDriveQuery = (
 	url: string,
 	params: Record<string, string | undefined>,
@@ -113,11 +121,28 @@ const parseDriveJson = async <T>(response: Response) => {
 	return JSON.parse(text) as T;
 };
 
+export class GoogleDriveRequestError extends Error {
+	constructor(
+		readonly status: number,
+		text: string,
+	) {
+		super(`Google Drive request failed: ${status} ${text}`);
+		this.name = "GoogleDriveRequestError";
+	}
+}
+
 const assertDriveResponse = async (response: Response) => {
 	if (response.ok || response.status === 308) return;
 	const text = await response.text().catch(() => "");
-	throw new Error(`Google Drive request failed: ${response.status} ${text}`);
+	throw new GoogleDriveRequestError(response.status, text);
 };
+
+const isDriveRequestStatus = (
+	error: Storage.StorageError,
+	...statuses: number[]
+) =>
+	error.cause instanceof GoogleDriveRequestError &&
+	statuses.includes(error.cause.status);
 
 const escapeDriveQueryValue = (value: string) =>
 	value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -960,10 +985,6 @@ export const createGoogleDriveResumableUpload = (
 ) =>
 	Effect.gen(function* () {
 		const contentType = normalizeContentType(input.contentType);
-		const [parentId, fileId] = yield* Effect.all([
-			getGoogleDriveUploadParentId(repo, config, input, tokenStore),
-			generateGoogleDriveFileId(config, tokenStore),
-		]);
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json; charset=UTF-8",
 			"X-Upload-Content-Type": contentType,
@@ -971,35 +992,138 @@ export const createGoogleDriveResumableUpload = (
 		if (input.contentLength !== undefined) {
 			headers["X-Upload-Content-Length"] = input.contentLength.toString();
 		}
+		// Google ties the resumable session's Access-Control-Allow-Origin to the
+		// Origin sent on this initiation request, so browser direct PUTs are
+		// CORS-blocked unless we set it here.
+		const browserUploadOrigin = getGoogleDriveBrowserUploadOrigin();
+		if (browserUploadOrigin) headers.Origin = browserUploadOrigin;
 
-		const response = yield* driveFetch(
-			config,
-			appendSharedDriveCreateParams(
-				`${DRIVE_UPLOAD_BASE}/files?uploadType=resumable&fields=id,name,mimeType,size`,
-			),
-			{
-				method: "POST",
-				headers,
-				body: JSON.stringify({
-					id: fileId,
-					name: getDriveFileName(input.key),
-					mimeType: contentType,
-					parents: [parentId],
-					appProperties: {
-						capObjectKey: input.key,
-					},
-				}),
-			},
-			tokenStore,
-		);
-		const uploadUrl = response.headers.get("Location");
-		if (!uploadUrl) {
-			return yield* Effect.fail(
-				new Storage.StorageError({
-					cause: new Error("Google Drive did not return an upload URL"),
+		const requireUploadUrl = (response: Response) =>
+			Option.fromNullable(response.headers.get("Location")).pipe(
+				Option.match({
+					onNone: () =>
+						Effect.fail(
+							new Storage.StorageError({
+								cause: new Error("Google Drive did not return an upload URL"),
+							}),
+						),
+					onSome: Effect.succeed,
 				}),
 			);
+
+		const startSessionForExistingFile = (fileId: string) =>
+			driveFetch(
+				config,
+				appendSharedDriveCreateParams(
+					`${DRIVE_UPLOAD_BASE}/files/${encodeURIComponent(fileId)}?uploadType=resumable&fields=id,name,mimeType,size`,
+				),
+				{
+					method: "PATCH",
+					headers,
+					body: JSON.stringify({
+						name: getDriveFileName(input.key),
+						mimeType: contentType,
+						appProperties: {
+							capObjectKey: input.key,
+						},
+					}),
+				},
+				tokenStore,
+			).pipe(Effect.flatMap(requireUploadUrl));
+
+		const startSessionForNewFile = (fileId: string, parentId: string) =>
+			driveFetch(
+				config,
+				appendSharedDriveCreateParams(
+					`${DRIVE_UPLOAD_BASE}/files?uploadType=resumable&fields=id,name,mimeType,size`,
+				),
+				{
+					method: "POST",
+					headers,
+					body: JSON.stringify({
+						id: fileId,
+						name: getDriveFileName(input.key),
+						mimeType: contentType,
+						parents: [parentId],
+						appProperties: {
+							capObjectKey: input.key,
+						},
+					}),
+				},
+				tokenStore,
+			).pipe(Effect.flatMap(requireUploadUrl));
+
+		const existing = yield* repo.getObjectByKey(input.integrationId, input.key);
+		if (Option.isSome(existing)) {
+			const existingFileId = existing.value.providerObjectId;
+			let resolvedFileId = existingFileId;
+
+			const patched = yield* startSessionForExistingFile(existingFileId).pipe(
+				Effect.either,
+			);
+			let uploadUrl: string;
+			if (Either.isRight(patched)) {
+				uploadUrl = patched.right;
+			} else if (isDriveRequestStatus(patched.left, 404, 410)) {
+				// The stored file id was reserved (files.generateIds) but its upload
+				// session never completed, so the file doesn't exist on Drive yet and
+				// can't be PATCHed. Create it instead, reusing the reserved id so
+				// concurrent presigns converge on the same file.
+				const parentId = yield* getGoogleDriveUploadParentId(
+					repo,
+					config,
+					input,
+					tokenStore,
+				);
+				const created = yield* startSessionForNewFile(
+					existingFileId,
+					parentId,
+				).pipe(Effect.either);
+				if (Either.isRight(created)) {
+					uploadUrl = created.right;
+				} else if (isDriveRequestStatus(created.left, 409)) {
+					// The file materialized between the two calls; PATCH now works.
+					uploadUrl = yield* startSessionForExistingFile(existingFileId);
+				} else {
+					// The reserved id itself is unusable (e.g. the integration was
+					// reconnected to a different account) — start over with a fresh id.
+					const freshFileId = yield* generateGoogleDriveFileId(
+						config,
+						tokenStore,
+					);
+					uploadUrl = yield* startSessionForNewFile(freshFileId, parentId);
+					resolvedFileId = freshFileId;
+				}
+			} else {
+				return yield* Effect.fail(patched.left);
+			}
+
+			yield* repo.upsertObject({
+				integrationId: input.integrationId,
+				ownerId: input.ownerId,
+				videoId: input.videoId,
+				objectKey: input.key,
+				providerObjectId: resolvedFileId,
+				uploadSessionUrl: uploadUrl,
+				uploadStatus: "pending",
+				contentType,
+				contentLength: input.contentLength ?? existing.value.contentLength,
+				metadata: {
+					...(existing.value.metadata ?? {}),
+					videoId: input.videoId ?? undefined,
+					fileName: getDriveFileName(input.key),
+					contentType,
+				},
+			});
+			return uploadUrl;
 		}
+
+		const [parentId, fileId] = yield* Effect.all([
+			getGoogleDriveUploadParentId(repo, config, input, tokenStore),
+			generateGoogleDriveFileId(config, tokenStore),
+		]);
+
+		const uploadUrl = yield* startSessionForNewFile(fileId, parentId);
 
 		yield* repo.upsertObject({
 			integrationId: input.integrationId,

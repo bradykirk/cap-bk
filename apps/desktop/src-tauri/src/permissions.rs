@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use crate::{general_settings::GeneralSettingsStore, windows::CapWindowId};
 #[cfg(target_os = "macos")]
-use cidre::av;
+use cidre::{av, sc};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 #[cfg(target_os = "macos")]
 use std::{
     future::Future,
     str::FromStr,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 #[cfg(target_os = "macos")]
@@ -21,6 +21,8 @@ use tracing::instrument;
 static MACOS_DOCK_VISIBILITY_SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_PENDING_PANEL_WINDOWS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "macos")]
+static MACOS_SCK_PERMISSION_MISMATCH_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 pub(crate) struct MacosPanelWindowActivationGuard {
@@ -158,13 +160,24 @@ fn macos_sync_activation_policy(app: &tauri::AppHandle, should_show_dock: bool) 
     }
 }
 
+// Changing the activation policy (which `set_dock_visibility` also does under
+// the hood) while any window owns a fullscreen Space makes AppKit throw an
+// NSException that aborts the process when it unwinds into Rust. Callers must
+// leave the policy alone until fullscreen exits.
+#[cfg(target_os = "macos")]
+fn macos_any_window_fullscreen(app: &tauri::AppHandle) -> bool {
+    app.webview_windows()
+        .values()
+        .any(|window| window.is_fullscreen().unwrap_or(false))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_macos_panel_window(
     app: &tauri::AppHandle,
 ) -> MacosPanelWindowActivationGuard {
     let prev = MACOS_PENDING_PANEL_WINDOWS.fetch_add(1, Ordering::AcqRel);
 
-    if prev == 0 {
+    if prev == 0 && !macos_any_window_fullscreen(app) {
         if let Err(err) = app.set_activation_policy(tauri::ActivationPolicy::Accessory) {
             tracing::warn!("Failed to prepare macOS panel activation policy: {err}");
         }
@@ -176,6 +189,10 @@ pub(crate) fn prepare_macos_panel_window(
 #[cfg(target_os = "macos")]
 pub(crate) fn sync_macos_dock_visibility(app: &tauri::AppHandle) {
     if MACOS_PENDING_PANEL_WINDOWS.load(Ordering::Acquire) > 0 {
+        return;
+    }
+
+    if macos_any_window_fullscreen(app) {
         return;
     }
 
@@ -223,17 +240,9 @@ pub(crate) fn schedule_macos_dock_visibility_sync(app: &tauri::AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn macos_permission_status(permission: &OSPermission, initial_check: bool) -> OSPermissionStatus {
-    #[cfg(debug_assertions)]
-    if matches!(
-        permission,
-        OSPermission::ScreenRecording | OSPermission::Accessibility
-    ) {
-        return OSPermissionStatus::Granted;
-    }
-
     match permission {
         OSPermission::ScreenRecording => {
-            let granted = scap_screencapturekit::has_permission();
+            let granted = macos_screen_recording_available();
             match (granted, initial_check) {
                 (true, _) => OSPermissionStatus::Granted,
                 (false, true) => OSPermissionStatus::Empty,
@@ -271,6 +280,44 @@ fn macos_permission_status(permission: &OSPermission, initial_check: bool) -> OS
                 OSPermissionStatus::Denied
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_screen_recording_available() -> bool {
+    if !scap_screencapturekit::has_permission() {
+        return false;
+    }
+
+    let future = async {
+        match sc::ShareableContent::current().await {
+            Ok(content) => {
+                let display_count = content.displays().len();
+                if display_count == 0
+                    && !MACOS_SCK_PERMISSION_MISMATCH_LOGGED.swap(true, Ordering::AcqRel)
+                {
+                    tracing::debug!(
+                        window_count = content.windows().len(),
+                        application_count = content.apps().len(),
+                        "ScreenCaptureKit returned no displays despite CoreGraphics screen-recording permission"
+                    );
+                }
+                display_count > 0
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "ScreenCaptureKit shareable content unavailable during permission check"
+                );
+                false
+            }
+        }
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| tauri::async_runtime::block_on(future))
+    } else {
+        tauri::async_runtime::block_on(future)
     }
 }
 

@@ -449,6 +449,27 @@ pub fn pts_to_frame(pts: i64, time_base: Rational, fps: u32) -> u32 {
 pub const FRAME_CACHE_SIZE: usize = 90;
 const DEFAULT_MAX_FALLBACK_DISTANCE: u32 = 90;
 
+/// Records a pts hole discovered from a decode-order vend jump (frames vend
+/// in pts order, so a jump means no samples exist in between). The map stays
+/// bounded by dropping the narrowest hole — wide static-screen holds matter
+/// most.
+pub(super) fn record_pts_hole(
+    holes: &mut std::collections::BTreeMap<u32, u32>,
+    start: u32,
+    end: u32,
+) {
+    const MAX_TRACKED_HOLES: usize = 64;
+    holes.insert(start, end);
+    if holes.len() > MAX_TRACKED_HOLES
+        && let Some(narrowest) = holes
+            .iter()
+            .min_by_key(|&(&s, &e)| e.saturating_sub(s))
+            .map(|(&s, _)| s)
+    {
+        holes.remove(&narrowest);
+    }
+}
+
 #[derive(Clone)]
 pub struct AsyncVideoDecoderHandle {
     sender: mpsc::Sender<VideoDecoderMessage>,
@@ -459,6 +480,7 @@ pub struct AsyncVideoDecoderHandle {
 
 impl AsyncVideoDecoderHandle {
     const INITIAL_SEEK_TIMEOUT_MS: u64 = 10000;
+    const INITIAL_MAX_FALLBACK_DISTANCE: u32 = 2;
 
     fn normal_timeout_ms(&self) -> u64 {
         let pixels = (self.status.video_width as u64) * (self.status.video_height as u64);
@@ -472,16 +494,26 @@ impl AsyncVideoDecoderHandle {
     }
 
     pub async fn get_frame(&self, time: f32) -> Option<DecodedFrame> {
-        self.get_frame_with_timeout(time, self.normal_timeout_ms())
+        self.get_frame_with_timeout(time, self.normal_timeout_ms(), self.max_fallback_distance)
             .await
     }
 
     pub async fn get_frame_initial(&self, time: f32) -> Option<DecodedFrame> {
-        self.get_frame_with_timeout(time, Self::INITIAL_SEEK_TIMEOUT_MS)
-            .await
+        self.get_frame_with_timeout(
+            time,
+            Self::INITIAL_SEEK_TIMEOUT_MS,
+            self.max_fallback_distance
+                .min(Self::INITIAL_MAX_FALLBACK_DISTANCE),
+        )
+        .await
     }
 
-    async fn get_frame_with_timeout(&self, time: f32, timeout_ms: u64) -> Option<DecodedFrame> {
+    async fn get_frame_with_timeout(
+        &self,
+        time: f32,
+        timeout_ms: u64,
+        max_fallback_distance: u32,
+    ) -> Option<DecodedFrame> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let adjusted_time = self.get_time(time);
 
@@ -489,11 +521,15 @@ impl AsyncVideoDecoderHandle {
             .sender
             .send(VideoDecoderMessage::GetFrame(
                 adjusted_time,
-                self.max_fallback_distance,
+                max_fallback_distance,
                 tx,
             ))
             .is_err()
         {
+            tracing::warn!(
+                time = adjusted_time,
+                "decoder thread is gone; frame request dropped"
+            );
             return None;
         }
 

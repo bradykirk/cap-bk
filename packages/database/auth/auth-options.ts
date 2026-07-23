@@ -6,6 +6,7 @@ import type { NextAuthOptions } from "next-auth";
 import { getServerSession as _getServerSession } from "next-auth";
 import type { Adapter } from "next-auth/adapters";
 import { decode, type JWT, type JWTDecodeParams } from "next-auth/jwt";
+import AppleProvider from "next-auth/providers/apple";
 import EmailProvider from "next-auth/providers/email";
 import GoogleProvider from "next-auth/providers/google";
 import type { Provider } from "next-auth/providers/index";
@@ -53,7 +54,7 @@ export const authOptions = (): NextAuthOptions => {
 			_adapter = DrizzleAdapter(db());
 			return _adapter;
 		},
-		debug: true,
+		debug: process.env.NODE_ENV !== "production",
 		session: {
 			strategy: "jwt",
 		},
@@ -68,7 +69,17 @@ export const authOptions = (): NextAuthOptions => {
 		},
 		get providers() {
 			if (_providers) return _providers;
+			const appleClientId = serverEnv().APPLE_CLIENT_ID;
+			const appleClientSecret = serverEnv().APPLE_CLIENT_SECRET;
 			_providers = [
+				...(appleClientId && appleClientSecret
+					? [
+							AppleProvider({
+								clientId: appleClientId,
+								clientSecret: appleClientSecret,
+							}),
+						]
+					: []),
 				GoogleProvider({
 					clientId: serverEnv().GOOGLE_CLIENT_ID as string,
 					clientSecret: serverEnv().GOOGLE_CLIENT_SECRET as string,
@@ -101,8 +112,6 @@ export const authOptions = (): NextAuthOptions => {
 						return crypto.randomInt(100000, 1000000).toString();
 					},
 					async sendVerificationRequest({ identifier, token }) {
-						console.log("sendVerificationRequest");
-
 						if (!serverEnv().RESEND_API_KEY) {
 							console.log("\n");
 							console.log(
@@ -120,10 +129,8 @@ export const authOptions = (): NextAuthOptions => {
 							);
 							console.log("\n");
 						} else {
-							console.log({ identifier, token });
 							const { OTPEmail } = await import("../emails/otp-email");
 							const email = OTPEmail({ code: token, email: identifier });
-							console.log({ email });
 							await sendEmail({
 								email: identifier,
 								subject: `Your Cap Verification Code`,
@@ -144,6 +151,25 @@ export const authOptions = (): NextAuthOptions => {
 					sameSite: "none",
 					path: "/",
 					secure: true,
+				},
+			},
+			callbackUrl: {
+				name: "next-auth.callback-url",
+				options: {
+					httpOnly: true,
+					sameSite: "none",
+					path: "/",
+					secure: true,
+				},
+			},
+			pkceCodeVerifier: {
+				name: "next-auth.pkce.code_verifier",
+				options: {
+					httpOnly: true,
+					sameSite: "none",
+					path: "/",
+					secure: true,
+					maxAge: 60 * 15,
 				},
 			},
 		},

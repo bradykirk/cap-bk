@@ -1,7 +1,9 @@
 use cap_camera::CameraInfo;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use cap_camera_ffmpeg::*;
 use cap_fail::fail_err;
 use cap_media_info::VideoInfo;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use cap_timestamp::Timestamp;
 use futures::{
     FutureExt,
@@ -9,8 +11,9 @@ use futures::{
 };
 use kameo::prelude::*;
 use replace_with::replace_with_or_abort;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+use std::cmp::Ordering;
 use std::{
-    cmp::Ordering,
     ops::Deref,
     sync::{
         Arc, Weak,
@@ -19,12 +22,15 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::oneshot, task::LocalSet};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::ffmpeg::FFmpegVideoFrame;
 use crate::output_pipeline::NativeCameraFrame;
 
 const CAMERA_INIT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Outer deadline for camera readiness. Must cover both capture attempts on
+/// macOS (native + compatibility fallback) plus session teardown in between.
+const CAMERA_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(target_os = "macos")]
 static CAMERA_CAPTURE_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -42,6 +48,7 @@ pub struct CameraFeed {
     setup_generation: u64,
     state: State,
     senders: Vec<flume::Sender<FFmpegVideoFrame>>,
+    ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     native_senders: Vec<flume::Sender<NativeCameraFrame>>,
     native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     on_ready: Vec<oneshot::Sender<()>>,
@@ -186,6 +193,7 @@ impl Default for CameraFeed {
                 attached: None,
             }),
             senders: Vec::new(),
+            ffmpeg_sender_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             native_senders: Vec::new(),
             native_sender_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             on_ready: Vec::new(),
@@ -334,6 +342,7 @@ struct CameraSetupArgs {
     actor_ref: ActorRef<CameraFeed>,
     new_frame_recipient: Recipient<NewFrame>,
     native_frame_recipient: Recipient<NewNativeFrame>,
+    ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     flow: CameraSetupFlow,
 }
@@ -348,6 +357,7 @@ fn spawn_camera_setup(
         actor_ref,
         new_frame_recipient,
         native_frame_recipient,
+        ffmpeg_sender_count,
         native_sender_count,
         flow,
     } = args;
@@ -398,7 +408,9 @@ fn spawn_camera_setup(
                     settings,
                     new_frame_recipient,
                     native_frame_recipient,
+                    ffmpeg_sender_count,
                     native_sender_count,
+                    &done_rx_thread,
                 )
                 .await;
 
@@ -482,24 +494,25 @@ fn spawn_camera_setup(
                     }
                 };
 
-                info!(
+                debug!(
                     "Camera capture thread: waiting for done signal for {:?}",
                     &id
                 );
 
                 drop(done_tx_thread);
-                let recv_result = done_rx_thread.recv();
-
-                warn!(
-                    "Camera capture thread: done signal received for {:?}, result={:?}",
-                    &id, recv_result
-                );
+                match done_rx_thread.recv() {
+                    Ok(()) => debug!("Camera capture thread: stop signal received for {:?}", &id),
+                    Err(_) => debug!(
+                        "Camera capture thread: stop signal channel closed for {:?}",
+                        &id
+                    ),
+                }
 
                 let _ = handle.stop_capturing();
 
                 std::thread::sleep(Duration::from_millis(50));
 
-                warn!("Camera capture thread: stopped capture of {:?}", &id);
+                debug!("Camera capture thread: capture closed for {:?}", &id);
             });
         }
 
@@ -513,7 +526,15 @@ fn release_camera_thread(handle: std::thread::JoinHandle<()>) {
     if handle.is_finished() {
         let _ = handle.join();
     } else {
-        warn!("Camera setup thread is still running after cancellation");
+        debug!("Camera setup thread is still running after cancellation");
+        if let Err(err) = std::thread::Builder::new()
+            .name("camera-setup-reaper".to_string())
+            .spawn(move || {
+                let _ = handle.join();
+            })
+        {
+            warn!(?err, "Failed to spawn camera-setup-reaper thread");
+        }
     }
 }
 
@@ -525,7 +546,7 @@ fn camera_ready_future(
     flow: CameraSetupFlow,
 ) -> BoxFuture<'static, Result<(CameraInfo, VideoInfo), SetInputError>> {
     async move {
-        match tokio::time::timeout(CAMERA_INIT_TIMEOUT, ready).await {
+        match tokio::time::timeout(CAMERA_READY_TIMEOUT, ready).await {
             Ok(result) => result.map(|v| (v.camera_info, v.video_info)),
             Err(err) => {
                 if matches!(flow, CameraSetupFlow::Open) {
@@ -562,6 +583,7 @@ pub enum SetInputError {
     Initialisation,
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn find_camera(selected_camera: &DeviceOrModelID) -> Option<cap_camera::CameraInfo> {
     cap_camera::list_cameras().find(|c| match selected_camera {
         DeviceOrModelID::DeviceID(device_id) => c.device_id() == device_id,
@@ -575,13 +597,20 @@ struct SetupCameraResult {
     video_info: VideoInfo,
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 static CAMERA_CALLBACK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const TARGET_CAMERA_WIDTH: u32 = 1280;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const TARGET_CAMERA_HEIGHT: u32 = 720;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const TARGET_CAMERA_FRAME_RATE: f32 = 30.0;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const PREFERRED_CAMERA_FRAME_RATE: f32 = 29.0;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const MIN_CAMERA_FRAME_RATE: f32 = 24.0;
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn select_preferred_camera_format(
     formats: &[cap_camera::Format],
     settings: CameraDeviceSettings,
@@ -626,6 +655,7 @@ fn select_preferred_camera_format(
     matches.into_iter().next()
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn select_camera_format(
     camera: &cap_camera::CameraInfo,
     settings: Option<CameraDeviceSettings>,
@@ -747,17 +777,88 @@ async fn setup_camera(
     settings: Option<CameraDeviceSettings>,
     recipient: Recipient<NewFrame>,
     native_recipient: Recipient<NewNativeFrame>,
+    ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+    cancel_rx: &mpsc::Receiver<()>,
 ) -> Result<SetupCameraResult, SetInputError> {
     let camera = find_camera(id).ok_or(SetInputError::DeviceNotFound)?;
     let format = select_camera_format(&camera, settings)?;
+
+    {
+        let mut fourcc = format.native().format_desc().media_sub_type().to_be_bytes();
+        tracing::info!(
+            camera = camera.display_name(),
+            width = format.width(),
+            height = format.height(),
+            frame_rate = format.frame_rate(),
+            pixel_format = cidre::four_cc_to_str(&mut fourcc),
+            "Starting camera capture"
+        );
+    }
+
+    let first_attempt = start_camera_capture_attempt(
+        &camera,
+        format.clone(),
+        cap_camera::CaptureMode::Native,
+        recipient.clone(),
+        native_recipient.clone(),
+        ffmpeg_sender_count.clone(),
+        native_sender_count.clone(),
+    )
+    .await;
+
+    match first_attempt {
+        Ok(result) => Ok(result),
+        // Some cameras start a session but never deliver frames when the
+        // native format is pinned (seen on Apple cameras on macOS 26.4 beta).
+        // Retry once letting AVFoundation negotiate everything itself.
+        Err(err @ (SetInputError::Timeout(_) | SetInputError::StartCapturing(_))) => {
+            if cancel_rx.try_recv().is_ok() {
+                return Err(err);
+            }
+
+            warn!(
+                camera = camera.display_name(),
+                "Camera produced no frames in native mode ({err}), retrying in compatibility mode"
+            );
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            start_camera_capture_attempt(
+                &camera,
+                format,
+                cap_camera::CaptureMode::Compatibility,
+                recipient,
+                native_recipient,
+                ffmpeg_sender_count,
+                native_sender_count,
+            )
+            .await
+            .inspect(|_| {
+                tracing::info!("Camera capture recovered in compatibility mode");
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn start_camera_capture_attempt(
+    camera: &cap_camera::CameraInfo,
+    format: cap_camera::Format,
+    mode: cap_camera::CaptureMode,
+    recipient: Recipient<NewFrame>,
+    native_recipient: Recipient<NewNativeFrame>,
+    ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+    native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<SetupCameraResult, SetInputError> {
     let frame_rate = format.frame_rate().round().max(1.0) as u32;
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let mut ready_signal = Some(ready_tx);
 
     let capture_handle = camera
-        .start_capturing(format.clone(), move |frame| {
+        .start_capturing_with_mode(format.clone(), mode, move |frame| {
             let callback_num =
                 CAMERA_CALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -772,6 +873,15 @@ async fn setup_camera(
                         timestamp,
                     }))
                     .try_send();
+            }
+
+            // Until the ready signal fires the first frame must still be
+            // converted to derive VideoInfo; afterwards skip the full-frame
+            // copy entirely when nothing consumes ffmpeg frames.
+            if ready_signal.is_none()
+                && ffmpeg_sender_count.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                return;
             }
 
             let Ok(mut ff_frame) = frame.as_ffmpeg() else {
@@ -814,18 +924,20 @@ async fn setup_camera(
 
     Ok(SetupCameraResult {
         handle: capture_handle,
-        camera_info: camera,
+        camera_info: camera.clone(),
         video_info,
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 async fn setup_camera(
     id: &DeviceOrModelID,
     settings: Option<CameraDeviceSettings>,
     recipient: Recipient<NewFrame>,
     native_recipient: Recipient<NewNativeFrame>,
+    ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
     native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+    _cancel_rx: &mpsc::Receiver<()>,
 ) -> Result<SetupCameraResult, SetInputError> {
     let camera = find_camera(id).ok_or(SetInputError::DeviceNotFound)?;
     let format = select_camera_format(&camera, settings)?;
@@ -878,6 +990,84 @@ async fn setup_camera(
                     }
                 }
             }
+
+            // Until the ready signal fires the first frame must still be
+            // converted to derive VideoInfo; afterwards skip the full-frame
+            // copy entirely when nothing consumes ffmpeg frames.
+            if ready_signal.is_none()
+                && ffmpeg_sender_count.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                return;
+            }
+
+            let Ok(mut ff_frame) = frame.as_ffmpeg() else {
+                return;
+            };
+
+            ff_frame.set_pts(Some(frame.timestamp.as_micros() as i64));
+
+            if let Some(signal) = ready_signal.take() {
+                let video_info = VideoInfo::from_raw_ffmpeg(
+                    ff_frame.format(),
+                    ff_frame.width(),
+                    ff_frame.height(),
+                    frame_rate,
+                );
+
+                let _ = signal.send(video_info);
+            }
+
+            let send_result = recipient
+                .tell(NewFrame(FFmpegVideoFrame {
+                    inner: ff_frame,
+                    timestamp,
+                }))
+                .try_send();
+
+            if send_result.is_err() && callback_num.is_multiple_of(30) {
+                tracing::warn!(
+                    "Camera callback: failed to send frame {} to actor (mailbox full?)",
+                    callback_num
+                );
+            }
+        })
+        .map_err(|e| SetInputError::StartCapturing(e.to_string()))?;
+
+    let video_info = tokio::time::timeout(CAMERA_INIT_TIMEOUT, ready_rx)
+        .await
+        .map_err(|e| SetInputError::Timeout(e.to_string()))?
+        .map_err(|_| SetInputError::Initialisation)?;
+
+    Ok(SetupCameraResult {
+        handle: capture_handle,
+        camera_info: camera,
+        video_info,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn setup_camera(
+    id: &DeviceOrModelID,
+    settings: Option<CameraDeviceSettings>,
+    recipient: Recipient<NewFrame>,
+    _native_recipient: Recipient<NewNativeFrame>,
+    _ffmpeg_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+    _native_sender_count: Arc<std::sync::atomic::AtomicUsize>,
+    _cancel_rx: &mpsc::Receiver<()>,
+) -> Result<SetupCameraResult, SetInputError> {
+    let camera = find_camera(id).ok_or(SetInputError::DeviceNotFound)?;
+    let format = select_camera_format(&camera, settings)?;
+    let frame_rate = format.frame_rate().round().max(1.0) as u32;
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let mut ready_signal = Some(ready_tx);
+
+    let capture_handle = camera
+        .start_capturing(format.clone(), move |frame| {
+            let callback_num =
+                CAMERA_CALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let timestamp = Timestamp::Instant(std::time::Instant::now());
 
             let Ok(mut ff_frame) = frame.as_ffmpeg() else {
                 return;
@@ -970,6 +1160,7 @@ impl Message<SetInput> for CameraFeed {
                     actor_ref,
                     new_frame_recipient,
                     native_frame_recipient,
+                    ffmpeg_sender_count: self.ffmpeg_sender_count.clone(),
                     native_sender_count: self.native_sender_count.clone(),
                     flow: CameraSetupFlow::Open,
                 });
@@ -1007,6 +1198,7 @@ impl Message<SetInput> for CameraFeed {
                     actor_ref,
                     new_frame_recipient,
                     native_frame_recipient,
+                    ffmpeg_sender_count: self.ffmpeg_sender_count.clone(),
                     native_sender_count: self.native_sender_count.clone(),
                     flow: CameraSetupFlow::Locked,
                 });
@@ -1043,6 +1235,8 @@ impl Message<RemoveInput> for CameraFeed {
         }
 
         self.senders.clear();
+        self.ffmpeg_sender_count
+            .store(0, std::sync::atomic::Ordering::Release);
         self.native_senders.clear();
         self.native_sender_count
             .store(0, std::sync::atomic::Ordering::Release);
@@ -1073,6 +1267,8 @@ impl Message<AddSender> for CameraFeed {
 
         debug!("CameraFeed: Adding new sender");
         self.senders.push(msg.0);
+        self.ffmpeg_sender_count
+            .store(self.senders.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1110,6 +1306,8 @@ impl Message<RemoveSender> for CameraFeed {
         _: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.senders.retain(|sender| !sender.same_channel(&msg.0));
+        self.ffmpeg_sender_count
+            .store(self.senders.len(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1172,6 +1370,19 @@ fn send_frame_to_camera_senders<T: Clone>(
     frame_num: u64,
     sender_label: &str,
 ) -> bool {
+    // A disconnected sender whose queue is still full would otherwise never be
+    // try_send'd again, leaving it (and its queued frames) retained forever.
+    let len_before_retain = senders.len();
+    senders.retain(|sender| !sender.is_disconnected());
+    let removed_disconnected = senders.len() != len_before_retain;
+    if removed_disconnected {
+        debug!(
+            "Removed {} closed {} senders before fanout",
+            len_before_retain - senders.len(),
+            sender_label
+        );
+    }
+
     let mut last_ready_sender = None;
 
     for (i, sender) in senders.iter().enumerate() {
@@ -1188,7 +1399,7 @@ fn send_frame_to_camera_senders<T: Clone>(
     }
 
     let Some(last_ready_sender) = last_ready_sender else {
-        return false;
+        return removed_disconnected;
     };
 
     let mut frame = Some(frame);
@@ -1222,8 +1433,8 @@ fn send_frame_to_camera_senders<T: Clone>(
                 }
             }
             Err(flume::TrySendError::Disconnected(_)) => {
-                warn!(
-                    "{} sender {} disconnected at frame {}, will be removed",
+                debug!(
+                    "{} sender {} closed at frame {}, will be removed",
                     sender_label, i, frame_num
                 );
                 to_remove.push(i);
@@ -1232,11 +1443,11 @@ fn send_frame_to_camera_senders<T: Clone>(
     }
 
     if to_remove.is_empty() {
-        return false;
+        return removed_disconnected;
     }
 
     debug!(
-        "Removing {} disconnected {} senders",
+        "Removing {} closed {} senders",
         to_remove.len(),
         sender_label
     );
@@ -1252,7 +1463,10 @@ impl Message<NewFrame> for CameraFeed {
     async fn handle(&mut self, msg: NewFrame, _: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let frame_num = CAMERA_FRAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        send_frame_to_camera_senders(&mut self.senders, msg.0, frame_num, "Camera");
+        if send_frame_to_camera_senders(&mut self.senders, msg.0, frame_num, "Camera") {
+            self.ffmpeg_sender_count
+                .store(self.senders.len(), std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -1300,7 +1514,7 @@ impl Message<Lock> for CameraFeed {
 
         if let Some(connecting) = &mut state.connecting {
             let ready = &mut connecting.ready;
-            let data = tokio::time::timeout(CAMERA_INIT_TIMEOUT, ready)
+            let data = tokio::time::timeout(CAMERA_READY_TIMEOUT, ready)
                 .await
                 .map_err(|err| {
                     LockFeedError::InitializeFailed(SetInputError::Timeout(err.to_string()))

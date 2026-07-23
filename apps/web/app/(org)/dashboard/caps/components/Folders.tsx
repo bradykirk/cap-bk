@@ -1,7 +1,7 @@
 "use client";
 
-import { Fit, Layout, useRive } from "@rive-app/react-canvas";
 import React, { useImperativeHandle } from "react";
+import { Fit, Layout, type RiveFile, useRive } from "@/lib/rive";
 import { useTheme } from "../../Contexts";
 
 export interface FolderHandle {
@@ -9,135 +9,139 @@ export interface FolderHandle {
 	stop: () => void;
 }
 
-export const NormalFolder = React.forwardRef<FolderHandle, object>(
-	(_props, ref) => {
-		const { theme } = useTheme();
-		const { rive, RiveComponent: NormalFolderRive } = useRive({
-			src: "/rive/dashboard.riv",
-			artboard: theme === "dark" ? "folder" : "folder-dark",
-			animations: "idle",
-			autoplay: false,
-			layout: new Layout({
-				fit: Fit.Contain,
-			}),
-		});
+export const NormalFolder = React.forwardRef<
+	FolderHandle,
+	{ riveFile: RiveFile | undefined }
+>((props, ref) => {
+	const { theme } = useTheme();
+	const { rive, RiveComponent: NormalFolderRive } = useRive({
+		riveFile: props.riveFile,
+		artboard: theme === "dark" ? "folder" : "folder-dark",
+		animations: "idle",
+		autoplay: false,
+		layout: new Layout({
+			fit: Fit.Contain,
+		}),
+	});
 
-		useImperativeHandle(
-			ref,
-			() => ({
-				play: (animationName: string) => {
-					if (!rive) return;
-					rive.play(animationName);
-				},
-				stop: () => {
-					if (!rive) return;
-					rive.stop();
-				},
-			}),
-			[rive],
-		);
+	useImperativeHandle(
+		ref,
+		() => ({
+			play: (animationName: string) => {
+				if (!rive) return;
+				rive.play(animationName);
+			},
+			stop: () => {
+				if (!rive) return;
+				rive.stop();
+			},
+		}),
+		[rive],
+	);
 
-		return (
-			<NormalFolderRive
-				key={`${theme}folder-normal`}
-				className="w-[50px] h-[50px]"
-			/>
-		);
-	},
-);
+	return (
+		<NormalFolderRive
+			key={`${theme}folder-normal`}
+			className="w-[50px] h-[50px]"
+		/>
+	);
+});
 
-export const BlueFolder = React.forwardRef<FolderHandle, object>(
-	(_props, ref) => {
-		const { rive, RiveComponent: BlueFolderRive } = useRive({
-			src: "/rive/dashboard.riv",
-			artboard: "folder-blue",
-			animations: "idle",
-			autoplay: false,
-			layout: new Layout({
-				fit: Fit.Contain,
-			}),
-		});
+export const BlueFolder = React.forwardRef<
+	FolderHandle,
+	{ riveFile: RiveFile | undefined }
+>((props, ref) => {
+	const { rive, RiveComponent: BlueFolderRive } = useRive({
+		riveFile: props.riveFile,
+		artboard: "folder-blue",
+		animations: "idle",
+		autoplay: false,
+		layout: new Layout({
+			fit: Fit.Contain,
+		}),
+	});
 
-		useImperativeHandle(
-			ref,
-			() => ({
-				play: (animationName: string) => {
-					if (!rive) return;
-					rive.play(animationName);
-				},
-				stop: () => {
-					if (!rive) return;
-					rive.stop();
-				},
-			}),
-			[rive],
-		);
+	useImperativeHandle(
+		ref,
+		() => ({
+			play: (animationName: string) => {
+				if (!rive) return;
+				rive.play(animationName);
+			},
+			stop: () => {
+				if (!rive) return;
+				rive.stop();
+			},
+		}),
+		[rive],
+	);
 
-		return <BlueFolderRive className="w-[50px] h-[50px]" />;
-	},
-);
+	return <BlueFolderRive className="w-[50px] h-[50px]" />;
+});
 
-export const RedFolder = React.forwardRef<FolderHandle, object>(
-	(_props, ref) => {
-		const { rive, RiveComponent: RedFolderRive } = useRive({
-			src: "/rive/dashboard.riv",
-			artboard: "folder-red",
-			animations: "idle",
-			autoplay: false,
-			layout: new Layout({
-				fit: Fit.Contain,
-			}),
-		});
+export const RedFolder = React.forwardRef<
+	FolderHandle,
+	{ riveFile: RiveFile | undefined }
+>((props, ref) => {
+	const { rive, RiveComponent: RedFolderRive } = useRive({
+		riveFile: props.riveFile,
+		artboard: "folder-red",
+		animations: "idle",
+		autoplay: false,
+		layout: new Layout({
+			fit: Fit.Contain,
+		}),
+	});
 
-		useImperativeHandle(
-			ref,
-			() => ({
-				play: (animationName: string) => {
-					if (!rive) return;
-					rive.play(animationName);
-				},
-				stop: () => {
-					if (!rive) return;
-					rive.stop();
-				},
-			}),
-			[rive],
-		);
+	useImperativeHandle(
+		ref,
+		() => ({
+			play: (animationName: string) => {
+				if (!rive) return;
+				rive.play(animationName);
+			},
+			stop: () => {
+				if (!rive) return;
+				rive.stop();
+			},
+		}),
+		[rive],
+	);
 
-		return <RedFolderRive className="w-[50px] h-[50px]" />;
-	},
-);
+	return <RedFolderRive className="w-[50px] h-[50px]" />;
+});
 
-export const YellowFolder = React.forwardRef<FolderHandle, object>(
-	(_props, ref) => {
-		const { rive, RiveComponent: YellowFolderRive } = useRive({
-			src: "/rive/dashboard.riv",
-			artboard: "folder-yellow",
-			animations: "idle",
-			autoplay: false,
-			layout: new Layout({
-				fit: Fit.Contain,
-			}),
-		});
+export const YellowFolder = React.forwardRef<
+	FolderHandle,
+	{ riveFile: RiveFile | undefined }
+>((props, ref) => {
+	const { rive, RiveComponent: YellowFolderRive } = useRive({
+		riveFile: props.riveFile,
+		artboard: "folder-yellow",
+		animations: "idle",
+		autoplay: false,
+		layout: new Layout({
+			fit: Fit.Contain,
+		}),
+	});
 
-		useImperativeHandle(
-			ref,
-			() => ({
-				play: (animationName: string) => {
-					if (!rive) return;
-					rive.play(animationName);
-				},
-				stop: () => {
-					if (!rive) return;
-					rive.stop();
-				},
-			}),
-			[rive],
-		);
+	useImperativeHandle(
+		ref,
+		() => ({
+			play: (animationName: string) => {
+				if (!rive) return;
+				rive.play(animationName);
+			},
+			stop: () => {
+				if (!rive) return;
+				rive.stop();
+			},
+		}),
+		[rive],
+	);
 
-		return <YellowFolderRive className="w-[50px] h-[50px]" />;
-	},
-);
+	return <YellowFolderRive className="w-[50px] h-[50px]" />;
+});
 
 interface AllFoldersProps {
 	color: "normal" | "blue" | "red" | "yellow";

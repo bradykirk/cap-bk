@@ -21,11 +21,13 @@ import {
 	Show,
 } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
+import toast from "solid-toast";
 import themePreviewAuto from "~/assets/theme-previews/auto.jpg";
 import themePreviewDark from "~/assets/theme-previews/dark.jpg";
 import themePreviewLight from "~/assets/theme-previews/light.jpg";
 import { Input } from "~/routes/editor/ui";
 import { authStore, generalSettingsStore } from "~/store";
+import { clientEnv } from "~/utils/env";
 import {
 	deriveGeneralSettings,
 	type GeneralSettingsStore,
@@ -39,6 +41,7 @@ import {
 	type PostDeletionBehaviour,
 	type PostStudioRecordingBehaviour,
 	type StudioRecordingQuality,
+	type UpdateChannel,
 	type WindowExclusion,
 } from "~/utils/tauri";
 import IconLucideAlertTriangle from "~icons/lucide/alert-triangle";
@@ -107,6 +110,8 @@ const coversDefaultExclusion = (
 type ExtendedGeneralSettingsStore = GeneralSettingsStore;
 
 const MAX_FPS_OPTIONS = [
+	{ value: 24, label: "24 FPS" },
+	{ value: 25, label: "25 FPS" },
 	{ value: 30, label: "30 FPS" },
 	{ value: 60, label: "60 FPS (Recommended)" },
 	{ value: 120, label: "120 FPS" },
@@ -117,6 +122,8 @@ const MAX_FPS_OPTIONS = [
 
 const DEFAULT_PROJECT_NAME_TEMPLATE =
 	"{target_name} ({target_kind}) {date} {time}";
+const FREE_INSTANT_MODE_MAX_RESOLUTION = 1280;
+const PRO_INSTANT_MODE_MAX_RESOLUTION = 1920;
 
 export default function GeneralSettings() {
 	const [store] = createResource(() => generalSettingsStore.get());
@@ -206,6 +213,16 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 	const [settings, setSettings] = createStore<ExtendedGeneralSettingsStore>(
 		deriveGeneralSettings(props.initialStore),
 	);
+	const auth = authStore.createQuery();
+	const hasCapPro = createMemo(() => {
+		const plan = auth.data?.plan;
+		return !!plan && (plan.upgraded || plan.manual);
+	});
+	const instantModeMaxResolution = createMemo(() =>
+		hasCapPro()
+			? (settings.instantModeMaxResolution ?? PRO_INSTANT_MODE_MAX_RESOLUTION)
+			: FREE_INSTANT_MODE_MAX_RESOLUTION,
+	);
 
 	createEffect(() => {
 		setSettings(reconcile(deriveGeneralSettings(props.initialStore)));
@@ -240,6 +257,11 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 	};
 
 	onMount(() => {
+		commands
+			.updateAuthPlan()
+			.then(() => auth.refetch())
+			.catch(console.error);
+
 		let pending: string | null = null;
 		try {
 			pending = localStorage.getItem("cap.settings.scrollToSection");
@@ -494,14 +516,22 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 					</Section>
 				)}
 
+				<CapProSection
+					hasCapPro={hasCapPro()}
+					instantResolution={instantModeMaxResolution()}
+					onInstantResolutionChange={(value) =>
+						handleChange("instantModeMaxResolution", value)
+					}
+					autoOpenShareableLinks={!settings.disableAutoOpenLinks}
+					onAutoOpenShareableLinksChange={(v) =>
+						handleChange("disableAutoOpenLinks", !v)
+					}
+				/>
+
 				<QualitySection
 					studioQuality={settings.studioRecordingQuality ?? "balanced"}
 					onStudioQualityChange={(value) =>
 						handleChange("studioRecordingQuality", value)
-					}
-					instantResolution={settings.instantModeMaxResolution ?? 1920}
-					onInstantResolutionChange={(value) =>
-						handleChange("instantModeMaxResolution", value)
 					}
 				/>
 
@@ -612,20 +642,33 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 					</SectionRows>
 				</Section>
 
-				<Section
-					title="Cap Pro"
-					description="Settings available with a Cap Pro license."
-					pro
-				>
-					<SectionRows>
-						<ToggleSettingItem
-							label="Auto-open shareable links"
-							description="Open the share link in your browser as soon as the upload finishes."
-							value={!settings.disableAutoOpenLinks}
-							onChange={(v) => handleChange("disableAutoOpenLinks", !v)}
-						/>
-					</SectionRows>
-				</Section>
+				<StorageSection
+					recordingsPath={settings.recordingsPath ?? null}
+					onPick={async () => {
+						try {
+							const path = await commands.pickRecordingsFolder();
+							if (path !== null) {
+								setSettings("recordingsPath", path);
+								await offerRecordingsMigration();
+							}
+						} catch (e) {
+							toast.error(
+								`Failed to choose recordings folder: ${e instanceof Error ? e.message : String(e)}`,
+							);
+						}
+					}}
+					onReset={async () => {
+						try {
+							await commands.resetRecordingsFolder();
+							setSettings("recordingsPath", null);
+							await offerRecordingsMigration();
+						} catch (e) {
+							toast.error(
+								`Failed to reset recordings folder: ${e instanceof Error ? e.message : String(e)}`,
+							);
+						}
+					}}
+				/>
 
 				<DefaultProjectNameCard
 					onChange={(value) =>
@@ -646,8 +689,21 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 					isWindows={ostype === "windows"}
 				/>
 
+				<UpdatesSection
+					value={settings.updateChannel ?? "stable"}
+					onChange={async (channel) => {
+						await handleChange("updateChannel", channel);
+						try {
+							await commands.updatesChannelChanged();
+						} catch (error) {
+							console.error("Failed to notify update channel change", error);
+						}
+					}}
+				/>
+
 				<ServerURLSetting
-					value={settings.serverUrl ?? "https://cap.so"}
+					value={settings.serverUrl ?? clientEnv.VITE_SERVER_URL}
+					defaultValue={clientEnv.VITE_SERVER_URL}
 					onChange={async (v) => {
 						const url = new URL(v);
 						const origin = url.origin;
@@ -674,6 +730,93 @@ function Inner(props: { initialStore: GeneralSettingsStore | null }) {
 	);
 }
 
+async function offerRecordingsMigration() {
+	let count = 0;
+	try {
+		count = await commands.countRecordingsToMigrate();
+	} catch {
+		// Recordings in other folders stay visible in the library either way,
+		// so a failed scan just means we don't offer the move.
+		return;
+	}
+	if (count === 0) return;
+
+	const plural = count === 1 ? "recording" : "recordings";
+	const shouldMove = await confirm(
+		`Move your ${count} existing ${plural} to the new location? Recordings stay in your library either way.`,
+	);
+	if (!shouldMove) return;
+
+	const toastId = toast.loading(`Moving ${count} ${plural}…`);
+	let unlisten: (() => void) | undefined;
+	try {
+		unlisten = await events.recordingsMigrationProgress.listen((e) => {
+			toast.loading(
+				`Moving recordings… ${Math.min(e.payload.done + 1, e.payload.total)}/${e.payload.total}`,
+				{ id: toastId },
+			);
+		});
+
+		const summary = await commands.migrateRecordingsToCurrentDir();
+
+		const parts = [
+			`Moved ${summary.moved} ${summary.moved === 1 ? "recording" : "recordings"}`,
+		];
+		if (summary.skippedInUse > 0) {
+			parts.push(`${summary.skippedInUse} in use — left in place`);
+		}
+		if (summary.failed.length > 0) {
+			parts.push(
+				`${summary.failed.length} failed — kept in the original folder`,
+			);
+			toast.error(parts.join(" · "), { id: toastId });
+		} else {
+			toast.success(parts.join(" · "), { id: toastId });
+		}
+	} catch (e) {
+		toast.error(
+			`Failed to move recordings: ${e instanceof Error ? e.message : String(e)}`,
+			{ id: toastId },
+		);
+	} finally {
+		unlisten?.();
+	}
+}
+
+function StorageSection(props: {
+	recordingsPath: string | null;
+	onPick: () => Promise<void>;
+	onReset: () => Promise<void>;
+}) {
+	const defaultLabel = "Default (Application Support)";
+	const displayPath = () => props.recordingsPath ?? defaultLabel;
+	const isCustom = () => props.recordingsPath !== null;
+
+	return (
+		<Section title="Storage" description="Where Cap saves your recordings.">
+			<SectionCard padded>
+				<div class="flex flex-col gap-3">
+					<div class="flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-3 border border-gray-4 min-w-0">
+						<span class="flex-1 text-xs text-gray-12 truncate font-mono">
+							{displayPath()}
+						</span>
+					</div>
+					<div class="flex justify-end gap-2">
+						<Show when={isCustom()}>
+							<Button size="sm" variant="gray" onClick={props.onReset}>
+								Reset to Default
+							</Button>
+						</Show>
+						<Button size="sm" variant="dark" onClick={props.onPick}>
+							Choose Folder
+						</Button>
+					</div>
+				</div>
+			</SectionCard>
+		</Section>
+	);
+}
+
 function TelemetryCard(props: {
 	value: boolean;
 	onChange: (value: boolean) => void;
@@ -688,6 +831,71 @@ function TelemetryCard(props: {
 					onChange={props.onChange}
 				/>
 			</SectionRows>
+		</Section>
+	);
+}
+
+type UpdateChannelOption = {
+	value: UpdateChannel;
+	label: string;
+	description: string;
+};
+
+const UPDATE_CHANNEL_OPTIONS: UpdateChannelOption[] = [
+	{
+		value: "stable",
+		label: "Stable",
+		description: "Versioned releases (recommended)",
+	},
+	{
+		value: "nightly",
+		label: "Nightly",
+		description:
+			"The newest builds, updated automatically in the background when you're not recording or exporting. May be unstable.",
+	},
+];
+
+function UpdatesSection(props: {
+	value: UpdateChannel;
+	onChange: (value: UpdateChannel) => void;
+}) {
+	const currentOption = createMemo(
+		() =>
+			UPDATE_CHANNEL_OPTIONS.find((option) => option.value === props.value) ??
+			UPDATE_CHANNEL_OPTIONS[0],
+	);
+
+	return (
+		<Section title="Updates" description="Choose which Cap builds you receive.">
+			<SectionCard>
+				<div class="flex flex-col gap-3 px-4 py-4">
+					<div class="flex justify-between items-start gap-4">
+						<div class="flex flex-col gap-0.5 min-w-0">
+							<p class="text-[13px] text-gray-12">Update channel</p>
+							<p class="text-xs leading-snug text-gray-10">
+								Which release channel Cap updates from.
+							</p>
+						</div>
+						<SegmentedControl
+							value={props.value}
+							onChange={props.onChange}
+							options={UPDATE_CHANNEL_OPTIONS.map((option) => ({
+								value: option.value,
+								label: option.label,
+							}))}
+						/>
+					</div>
+					<div class="flex flex-col gap-1.5 px-3 py-2.5 rounded-lg bg-gray-3">
+						<p class="text-xs text-gray-12">{currentOption().description}</p>
+						<Show when={props.value === "nightly"}>
+							<p class="text-[11px] text-gray-10 leading-snug">
+								Switching back to Stable will return you to the latest stable
+								version, which may be older than your current build.
+							</p>
+						</Show>
+					</div>
+				</div>
+			</SectionCard>
 		</Section>
 	);
 }
@@ -808,63 +1016,130 @@ function StudioQualitySubsection(props: {
 	);
 }
 
-function InstantQualitySubsection(props: {
+function InstantQualitySetting(props: {
+	hasCapPro: boolean;
 	value: number;
 	onChange: (value: number) => void;
 }) {
+	const effectiveValue = createMemo(() =>
+		props.hasCapPro ? props.value : FREE_INSTANT_MODE_MAX_RESOLUTION,
+	);
 	const currentTier = createMemo(
 		() =>
-			INSTANT_RESOLUTION_TIERS.find((t) => t.value === props.value) ??
-			INSTANT_RESOLUTION_TIERS[1],
+			INSTANT_RESOLUTION_TIERS.find((t) => t.value === effectiveValue()) ??
+			INSTANT_RESOLUTION_TIERS[0],
 	);
+	const handleResolutionClick = async (value: number) => {
+		if (props.hasCapPro || value === FREE_INSTANT_MODE_MAX_RESOLUTION) {
+			props.onChange(value);
+			return;
+		}
+
+		toast.custom(
+			(t) => (
+				<div class="flex gap-3 items-center px-4 py-3 rounded-xl border shadow-lg bg-gray-1 border-gray-4 text-gray-12">
+					<p class="text-sm">
+						Upgrade to Cap Pro to record Instant Mode videos above 720p.
+					</p>
+					<button
+						type="button"
+						class="px-2.5 py-1 text-xs font-medium rounded-lg transition-colors bg-blue-9 text-white hover:bg-blue-10"
+						onClick={() => {
+							toast.dismiss(t.id);
+							void commands.showWindow("Upgrade");
+						}}
+					>
+						Upgrade
+					</button>
+				</div>
+			),
+			{ duration: 6000 },
+		);
+	};
 
 	return (
-		<div
+		<SettingItem
 			id="settings-section-instant-quality"
-			class="flex flex-col gap-3 px-4 py-4"
+			label="Instant Mode quality"
+			description={
+				props.hasCapPro
+					? "Choose the maximum upload resolution for Instant recordings."
+					: "Instant recordings are locked to 720p. Cap Pro unlocks higher resolutions."
+			}
 		>
-			<div class="flex justify-between items-start gap-4">
-				<div class="flex flex-col gap-0.5 min-w-0">
-					<p class="text-[13px] text-gray-12">Instant mode</p>
-					<p class="text-xs leading-snug text-gray-10">
-						Maximum upload resolution for Instant recordings.
-					</p>
+			<div class="flex flex-col items-end gap-1.5">
+				<div class="inline-flex p-0.5 rounded-lg border border-gray-3 bg-gray-3">
+					<For each={INSTANT_RESOLUTION_TIERS}>
+						{(tier) => {
+							const isSelected = () => effectiveValue() === tier.value;
+							return (
+								<button
+									type="button"
+									onClick={() => void handleResolutionClick(tier.value)}
+									class={cx(
+										"px-3 py-1 text-xs font-medium rounded-md transition-[background-color,color,box-shadow]",
+										isSelected()
+											? "bg-gray-1 text-gray-12 shadow-sm"
+											: "text-gray-10 hover:text-gray-12",
+									)}
+								>
+									{tier.label}
+								</button>
+							);
+						}}
+					</For>
 				</div>
-				<SegmentedControl
-					value={props.value}
-					onChange={props.onChange}
-					options={INSTANT_RESOLUTION_TIERS.map((tier) => ({
-						value: tier.value,
-						label: tier.label,
-					}))}
+				<p class="text-[11px] leading-snug text-right text-gray-10">
+					{currentTier().summary}
+				</p>
+			</div>
+		</SettingItem>
+	);
+}
+
+function CapProSection(props: {
+	hasCapPro: boolean;
+	instantResolution: number;
+	onInstantResolutionChange: (value: number) => void;
+	autoOpenShareableLinks: boolean;
+	onAutoOpenShareableLinksChange: (value: boolean) => void;
+}) {
+	return (
+		<Section
+			title="Cap Pro"
+			description="Settings available with a Cap Pro license."
+			pro
+		>
+			<SectionRows>
+				<InstantQualitySetting
+					hasCapPro={props.hasCapPro}
+					value={props.instantResolution}
+					onChange={props.onInstantResolutionChange}
 				/>
-			</div>
-			<div class="flex flex-col gap-1.5 px-3 py-2.5 rounded-lg bg-gray-3">
-				<p class="text-xs text-gray-12">{currentTier().summary}</p>
-			</div>
-		</div>
+				<ToggleSettingItem
+					label="Auto-open shareable links"
+					description="Open the share link in your browser as soon as the upload finishes."
+					value={props.autoOpenShareableLinks}
+					onChange={props.onAutoOpenShareableLinksChange}
+				/>
+			</SectionRows>
+		</Section>
 	);
 }
 
 function QualitySection(props: {
 	studioQuality: StudioRecordingQuality;
 	onStudioQualityChange: (value: StudioRecordingQuality) => void;
-	instantResolution: number;
-	onInstantResolutionChange: (value: number) => void;
 }) {
 	return (
 		<Section
 			title="Quality"
-			description="Pick the right profile for each recording mode."
+			description="Pick the right profile for local Studio recordings."
 		>
-			<SectionCard class="divide-y divide-gray-3">
+			<SectionCard>
 				<StudioQualitySubsection
 					value={props.studioQuality}
 					onChange={props.onStudioQualityChange}
-				/>
-				<InstantQualitySubsection
-					value={props.instantResolution}
-					onChange={props.onInstantResolutionChange}
 				/>
 			</SectionCard>
 		</Section>
@@ -873,9 +1148,20 @@ function QualitySection(props: {
 
 function ServerURLSetting(props: {
 	value: string;
+	defaultValue: string;
 	onChange: (v: string) => void;
 }) {
 	const [value, setValue] = createWritableMemo(() => props.value);
+	const isDefaultValue = () =>
+		props.value === props.defaultValue && value() === props.defaultValue;
+	const resetToDefault = () => {
+		if (props.value === props.defaultValue) {
+			setValue(props.defaultValue);
+			return;
+		}
+
+		props.onChange(props.defaultValue);
+	};
 
 	return (
 		<Section
@@ -892,7 +1178,15 @@ function ServerURLSetting(props: {
 							onInput={(e) => setValue(e.currentTarget.value)}
 						/>
 					</label>
-					<div class="flex justify-end">
+					<div class="flex justify-end gap-2">
+						<Button
+							size="sm"
+							variant="gray"
+							disabled={isDefaultValue()}
+							onClick={resetToDefault}
+						>
+							Reset to Default
+						</Button>
 						<Button
 							size="sm"
 							variant="dark"
@@ -976,7 +1270,7 @@ function DefaultProjectNameCard(props: {
 			<button
 				type="button"
 				title="Click to copy"
-				class="px-1.5 py-0.5 mx-0.5 font-mono text-[11px] rounded-md transition-[background-color,color,transform] duration-150 ease-out cursor-pointer bg-gray-3 hover:bg-gray-4 active:scale-95 text-gray-12"
+				class="px-1.5 py-0.5 mx-0.5 font-mono text-[11px] rounded-md transition-[background-color,color,transform] duration-150 ease-out bg-gray-3 hover:bg-gray-4 active:scale-95 text-gray-12"
 				onClick={() => commands.writeClipboardString(props.children)}
 			>
 				{props.children}

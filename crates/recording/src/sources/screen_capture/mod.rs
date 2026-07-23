@@ -8,6 +8,8 @@ use specta::Type;
 use std::time::SystemTime;
 use tracing::*;
 
+pub mod cadence;
+
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -17,6 +19,11 @@ pub use windows::*;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::*;
 
 pub struct StopCapturing;
 
@@ -65,6 +72,25 @@ pub enum ScreenCaptureTarget {
     CameraOnly,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub enum LinuxCaptureSource {
+    Display,
+    Window,
+    Area,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCaptureSource {
+    pub fn from_target(target: &ScreenCaptureTarget) -> Self {
+        match target {
+            ScreenCaptureTarget::Window { .. } => Self::Window,
+            ScreenCaptureTarget::Area { .. } => Self::Area,
+            ScreenCaptureTarget::Display { .. } | ScreenCaptureTarget::CameraOnly => Self::Display,
+        }
+    }
+}
+
 impl ScreenCaptureTarget {
     pub fn display(&self) -> Option<Display> {
         match self {
@@ -100,6 +126,16 @@ impl ScreenCaptureTarget {
                 {
                     let display = self.display()?;
                     return Some(CursorCropBounds::new_windows(PhysicalBounds::new(
+                        PhysicalPosition::new(0.0, 0.0),
+                        display.raw_handle().physical_size()?,
+                    )));
+                }
+
+                #[cfg(target_os = "linux")]
+                #[allow(clippy::needless_return)]
+                {
+                    let display = self.display()?;
+                    return Some(CursorCropBounds::new_linux(PhysicalBounds::new(
                         PhysicalPosition::new(0.0, 0.0),
                         display.raw_handle().physical_size()?,
                     )));
@@ -141,6 +177,24 @@ impl ScreenCaptureTarget {
                         ),
                     )));
                 }
+
+                #[cfg(target_os = "linux")]
+                #[allow(clippy::needless_return)]
+                {
+                    let display_bounds = self.display()?.raw_handle().physical_bounds()?;
+                    let window_bounds = window.raw_handle().physical_bounds()?;
+
+                    return Some(CursorCropBounds::new_linux(PhysicalBounds::new(
+                        PhysicalPosition::new(
+                            window_bounds.position().x() - display_bounds.position().x(),
+                            window_bounds.position().y() - display_bounds.position().y(),
+                        ),
+                        PhysicalSize::new(
+                            window_bounds.size().width(),
+                            window_bounds.size().height(),
+                        ),
+                    )));
+                }
             }
             Self::Area { bounds, .. } => {
                 #[cfg(target_os = "macos")]
@@ -153,21 +207,26 @@ impl ScreenCaptureTarget {
                 #[allow(clippy::needless_return)]
                 {
                     let display = self.display()?;
-                    let display_bounds = display.raw_handle().physical_bounds()?;
-                    let display_logical_size = display.logical_size()?;
+                    let bounds = logical_area_to_physical_bounds(
+                        *bounds,
+                        display.logical_size()?,
+                        display.physical_size()?,
+                    )?;
 
-                    let scale = display_bounds.size().width() / display_logical_size.width();
+                    return Some(CursorCropBounds::new_windows(bounds));
+                }
 
-                    return Some(CursorCropBounds::new_windows(PhysicalBounds::new(
-                        PhysicalPosition::new(
-                            bounds.position().x() * scale,
-                            bounds.position().y() * scale,
-                        ),
-                        PhysicalSize::new(
-                            bounds.size().width() * scale,
-                            bounds.size().height() * scale,
-                        ),
-                    )));
+                #[cfg(target_os = "linux")]
+                #[allow(clippy::needless_return)]
+                {
+                    let display = self.display()?;
+                    let bounds = logical_area_to_physical_bounds(
+                        *bounds,
+                        display.logical_size()?,
+                        display.physical_size()?,
+                    )?;
+
+                    return Some(CursorCropBounds::new_linux(bounds));
                 }
             }
             Self::CameraOnly => None,
@@ -180,13 +239,29 @@ impl ScreenCaptureTarget {
             Self::Window { id } => Window::from_id(id).and_then(|w| w.physical_size()),
             Self::Area { bounds, .. } => {
                 let display = self.display()?;
-                let scale = display.physical_size()?.width() / display.logical_size()?.width();
-                let size = bounds.size();
 
-                Some(PhysicalSize::new(
-                    size.width() * scale,
-                    size.height() * scale,
-                ))
+                #[cfg(target_os = "macos")]
+                {
+                    let scale = display.physical_size()?.width() / display.logical_size()?.width();
+                    let size = bounds.size();
+
+                    Some(PhysicalSize::new(
+                        size.width() * scale,
+                        size.height() * scale,
+                    ))
+                }
+
+                #[cfg(any(windows, target_os = "linux"))]
+                {
+                    Some(
+                        logical_area_to_physical_bounds(
+                            *bounds,
+                            display.logical_size()?,
+                            display.physical_size()?,
+                        )?
+                        .size(),
+                    )
+                }
             }
             Self::CameraOnly => None,
         }
@@ -301,6 +376,8 @@ pub struct Config {
     crop_bounds: Option<CropBounds>,
     fps: u32,
     show_cursor: bool,
+    #[cfg(target_os = "linux")]
+    linux_source: LinuxCaptureSource,
 }
 
 #[cfg(target_os = "macos")]
@@ -308,6 +385,63 @@ pub type CropBounds = LogicalBounds;
 
 #[cfg(windows)]
 pub type CropBounds = PhysicalBounds;
+
+#[cfg(target_os = "linux")]
+pub type CropBounds = PhysicalBounds;
+
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn logical_area_to_physical_bounds(
+    bounds: LogicalBounds,
+    logical_display_size: LogicalSize,
+    physical_display_size: PhysicalSize,
+) -> Option<PhysicalBounds> {
+    let (x, width) = logical_axis_to_physical(
+        bounds.position().x(),
+        bounds.size().width(),
+        logical_display_size.width(),
+        physical_display_size.width(),
+    )?;
+    let (y, height) = logical_axis_to_physical(
+        bounds.position().y(),
+        bounds.size().height(),
+        logical_display_size.height(),
+        physical_display_size.height(),
+    )?;
+
+    Some(PhysicalBounds::new(
+        PhysicalPosition::new(x, y),
+        PhysicalSize::new(width, height),
+    ))
+}
+
+#[cfg(any(windows, target_os = "linux", test))]
+fn logical_axis_to_physical(
+    position: f64,
+    size: f64,
+    logical_extent: f64,
+    physical_extent: f64,
+) -> Option<(f64, f64)> {
+    if !position.is_finite()
+        || !size.is_finite()
+        || !logical_extent.is_finite()
+        || !physical_extent.is_finite()
+        || logical_extent <= 0.0
+        || physical_extent <= 0.0
+    {
+        return None;
+    }
+
+    let start = position.clamp(0.0, logical_extent);
+    let end = (position + size).clamp(0.0, logical_extent);
+    let scale = physical_extent / logical_extent;
+    let physical_start = start.min(end) * scale;
+    let physical_end = start.max(end) * scale;
+    let min_size = 2.0_f64.min(physical_extent);
+    let size = (physical_end - physical_start).clamp(min_size, physical_extent);
+    let position = physical_start.min(physical_extent - size).max(0.0);
+
+    Some((position, size))
+}
 
 impl Config {
     pub fn fps(&self) -> u32 {
@@ -335,6 +469,7 @@ impl<TCaptureFormat: ScreenCaptureFormat> ScreenCaptureConfig<TCaptureFormat> {
         max_capture_size: Option<(u32, u32)>,
         start_time: SystemTime,
         system_audio: bool,
+        #[cfg(target_os = "linux")] linux_source: LinuxCaptureSource,
         #[cfg(windows)] d3d_device: ::windows::Win32::Graphics::Direct3D11::ID3D11Device,
         #[cfg(target_os = "macos")] shareable_content: SendableShareableContent,
         #[cfg(target_os = "macos")] excluded_windows: Vec<WindowId>,
@@ -360,10 +495,33 @@ impl<TCaptureFormat: ScreenCaptureFormat> ScreenCaptureConfig<TCaptureFormat> {
             {
                 crop_bounds.map(|b| b.size().map(|v| (v / 2.0).floor() * 2.0))
             }
+
+            #[cfg(target_os = "linux")]
+            {
+                crop_bounds.map(|b| b.size().map(|v| (v / 2.0).floor() * 2.0))
+            }
         }
         .or_else(|| display.physical_size())
         .ok_or(ScreenCaptureInitError::NoBounds)?;
         let output_size = constrain_capture_size(native_output_size, max_capture_size);
+
+        // Diagnostic anchor for area/crop capture: `crop_bounds` is the region the
+        // capturer will read (physical px on Windows/Linux, logical pts on macOS).
+        // For a selection spanning the whole monitor the crop size should match the
+        // display's physical size — a smaller value here means the overlay/crop was
+        // computed against the wrong coordinate space.
+        // (Hoisted into a local because `use tracing::*` glob-imports a `display`
+        // helper that would otherwise shadow the `display` binding inside the macro.)
+        let display_physical_size = display.physical_size();
+        tracing::info!(
+            crop_bounds = ?crop_bounds,
+            ?display_physical_size,
+            native_output_width = native_output_size.width(),
+            native_output_height = native_output_size.height(),
+            output_width = output_size.width(),
+            output_height = output_size.height(),
+            "Screen capture configured"
+        );
 
         Ok(Self {
             config: Config {
@@ -371,6 +529,8 @@ impl<TCaptureFormat: ScreenCaptureFormat> ScreenCaptureConfig<TCaptureFormat> {
                 crop_bounds,
                 fps,
                 show_cursor,
+                #[cfg(target_os = "linux")]
+                linux_source,
             },
             video_info: VideoInfo::from_raw_ffmpeg(
                 TCaptureFormat::pixel_format(),
@@ -437,17 +597,19 @@ where
 pub fn list_displays() -> Vec<(CaptureDisplay, Display)> {
     scap_targets::Display::list()
         .into_iter()
-        .filter_map(|display| {
+        .map(|display| {
             let refresh_rate = validated_refresh_rate(display.raw_handle().refresh_rate());
 
-            Some((
+            (
                 CaptureDisplay {
                     id: display.id(),
-                    name: display.name()?,
+                    name: display
+                        .name()
+                        .unwrap_or_else(|| format!("Display {}", display.id())),
                     refresh_rate,
                 },
                 display,
-            ))
+            )
         })
         .collect()
 }
@@ -503,4 +665,143 @@ pub fn list_windows() -> Vec<(CaptureWindow, Window)> {
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_area_to_physical_bounds_scales_each_axis() {
+        let bounds = LogicalBounds::new(
+            LogicalPosition::new(120.0, 80.0),
+            LogicalSize::new(640.0, 360.0),
+        );
+        let physical = logical_area_to_physical_bounds(
+            bounds,
+            LogicalSize::new(1920.0, 1080.0),
+            PhysicalSize::new(3840.0, 2160.0),
+        )
+        .unwrap();
+
+        assert_eq!(physical.position().x(), 240.0);
+        assert_eq!(physical.position().y(), 160.0);
+        assert_eq!(physical.size().width(), 1280.0);
+        assert_eq!(physical.size().height(), 720.0);
+    }
+
+    #[test]
+    fn logical_area_to_physical_bounds_clamps_to_display() {
+        let bounds = LogicalBounds::new(
+            LogicalPosition::new(-10.0, 100.0),
+            LogicalSize::new(2_000.0, 1_000.0),
+        );
+        let physical = logical_area_to_physical_bounds(
+            bounds,
+            LogicalSize::new(1920.0, 1080.0),
+            PhysicalSize::new(3840.0, 2160.0),
+        )
+        .unwrap();
+
+        assert_eq!(physical.position().x(), 0.0);
+        assert_eq!(physical.position().y(), 200.0);
+        assert_eq!(physical.size().width(), 3840.0);
+        assert_eq!(physical.size().height(), 1960.0);
+    }
+
+    #[test]
+    fn logical_area_to_physical_bounds_keeps_edge_crop_inside_display() {
+        let bounds = LogicalBounds::new(
+            LogicalPosition::new(1930.0, -20.0),
+            LogicalSize::new(100.0, 0.0),
+        );
+        let physical = logical_area_to_physical_bounds(
+            bounds,
+            LogicalSize::new(1920.0, 1080.0),
+            PhysicalSize::new(3840.0, 2160.0),
+        )
+        .unwrap();
+
+        assert_eq!(physical.position().x(), 3838.0);
+        assert_eq!(physical.position().y(), 0.0);
+        assert_eq!(physical.size().width(), 2.0);
+        assert_eq!(physical.size().height(), 2.0);
+    }
+
+    // Regression coverage for the HiDPI secondary-monitor area bug: a selection
+    // that spans the entire overlay (== the display's logical size) must map to
+    // the entire physical display, with no truncation, at every common scale.
+    // These pin the invariant that made "records ~70% of the selection" possible
+    // once the overlay is correctly sized to cover the monitor.
+    #[test]
+    fn full_selection_covers_full_display_at_every_scale() {
+        // (logical_size, physical_size) pairs for 100/125/150/175/200% scaling.
+        let scales = [
+            (
+                LogicalSize::new(1920.0, 1080.0),
+                PhysicalSize::new(1920.0, 1080.0),
+            ), // 100%
+            (
+                LogicalSize::new(1536.0, 864.0),
+                PhysicalSize::new(1920.0, 1080.0),
+            ), // 125%
+            (
+                LogicalSize::new(1280.0, 720.0),
+                PhysicalSize::new(1920.0, 1080.0),
+            ), // 150%
+            (
+                LogicalSize::new(1097.142_857_142_857, 617.142_857_142_857),
+                PhysicalSize::new(1920.0, 1080.0),
+            ), // 175%
+            (
+                LogicalSize::new(1280.0, 720.0),
+                PhysicalSize::new(2560.0, 1440.0),
+            ), // 200%
+        ];
+
+        for (logical, physical) in scales {
+            let selection = LogicalBounds::new(LogicalPosition::new(0.0, 0.0), logical);
+            let crop = logical_area_to_physical_bounds(selection, logical, physical).unwrap();
+
+            assert_eq!(
+                crop.position().x(),
+                0.0,
+                "full selection must start at x=0 (logical {logical:?})"
+            );
+            assert_eq!(
+                crop.position().y(),
+                0.0,
+                "full selection must start at y=0 (logical {logical:?})"
+            );
+            assert_eq!(
+                crop.size().width(),
+                physical.width(),
+                "full selection must span full physical width (logical {logical:?})"
+            );
+            assert_eq!(
+                crop.size().height(),
+                physical.height(),
+                "full selection must span full physical height (logical {logical:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_selection_scales_by_display_dpi() {
+        // 150% display: logical 1280x720 backed by physical 1920x1080.
+        let logical = LogicalSize::new(1280.0, 720.0);
+        let physical = PhysicalSize::new(1920.0, 1080.0);
+        let selection = LogicalBounds::new(
+            LogicalPosition::new(100.0, 100.0),
+            LogicalSize::new(500.0, 300.0),
+        );
+
+        let crop = logical_area_to_physical_bounds(selection, logical, physical).unwrap();
+
+        // Every axis multiplied by the 1.5 device scale.
+        assert_eq!(crop.position().x(), 150.0);
+        assert_eq!(crop.position().y(), 150.0);
+        assert_eq!(crop.size().width(), 750.0);
+        assert_eq!(crop.size().height(), 450.0);
+    }
 }

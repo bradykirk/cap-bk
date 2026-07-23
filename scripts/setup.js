@@ -20,14 +20,18 @@ const arch =
 	process.env.RUST_TARGET_TRIPLE?.split("-")[0] ??
 	(process.arch === "arm64" ? "aarch64" : "x86_64");
 
-const BASE_CARGO_TOML = `[env]
+const FFMPEG_CARGO_ENV = `[env]
 FFMPEG_DIR = { relative = true, force = true, value = "target/native-deps" }
 `;
+
+function cargoConfigPath(value) {
+	return value.replaceAll("\\", "/");
+}
 
 async function main() {
 	await fs.mkdir(targetDir, { recursive: true });
 
-	let cargoConfigContents = BASE_CARGO_TOML;
+	let cargoConfigContents = "";
 	let cargoBuildContents = "";
 	const sccachePath = await findExecutable("sccache");
 	const useSccache = env.CAP_USE_SCCACHE === "1";
@@ -43,6 +47,8 @@ async function main() {
 		);
 
 	if (process.platform === "darwin") {
+		cargoConfigContents += FFMPEG_CARGO_ENV;
+
 		const NATIVE_DEPS_VERSION = "v0.25";
 		const NATIVE_DEPS_URL = `https://github.com/spacedriveapp/native-deps/releases/download/${NATIVE_DEPS_VERSION}`;
 
@@ -52,7 +58,10 @@ async function main() {
 		};
 
 		const nativeDepsTar = NATIVE_DEPS_ASSETS[arch];
-		const nativeDepsTarPath = path.join(targetDir, nativeDepsTar);
+		const nativeDepsTarPath = path.join(
+			targetDir,
+			`${NATIVE_DEPS_VERSION}-${nativeDepsTar}`,
+		);
 		let downloadedNativeDeps = false;
 
 		if (!(await fileExists(nativeDepsTarPath))) {
@@ -120,6 +129,8 @@ async function main() {
 			onnxRuntimePath,
 		)}" }\n`;
 	} else if (process.platform === "win32") {
+		cargoConfigContents += FFMPEG_CARGO_ENV;
+
 		await ensureMsvcVersion();
 
 		const FFMPEG_VERSION = "7.1";
@@ -183,6 +194,11 @@ async function main() {
 		);
 		console.log("Copied ffmpeg/lib and ffmpeg/include to target/native-deps");
 
+		const onnxRuntimePath = await setupWindowsOnnxRuntime();
+		cargoConfigContents += `ORT_DYLIB_PATH = { relative = true, force = true, value = "${cargoConfigPath(
+			path.relative(__root, onnxRuntimePath),
+		)}" }\n`;
+
 		const { stdout: vcInstallDir } = await exec(
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: PowerShell syntax, not JS template literal
 			'$(& "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)',
@@ -198,6 +214,75 @@ async function main() {
 			"\\",
 			"/",
 		)}"\n`;
+	} else if (process.platform === "linux") {
+		const triple = process.env.RUST_TARGET_TRIPLE;
+		if (triple) {
+			cargoConfigContents += FFMPEG_CARGO_ENV;
+
+			const NATIVE_DEPS_VERSION = "v0.26";
+			const NATIVE_DEPS_URL = `https://github.com/spacedriveapp/native-deps/releases/download/${NATIVE_DEPS_VERSION}`;
+			const NATIVE_DEPS_ASSETS = {
+				x86_64: "native-deps-x86_64-linux-gnu.tar.xz",
+				aarch64: "native-deps-aarch64-linux-gnu.tar.xz",
+			};
+
+			const nativeDepsTar = NATIVE_DEPS_ASSETS[arch];
+			if (!nativeDepsTar)
+				throw new Error(`Unsupported Linux arch for native deps: ${arch}`);
+
+			const nativeDepsTarPath = path.join(
+				targetDir,
+				`${NATIVE_DEPS_VERSION}-${nativeDepsTar}`,
+			);
+			let downloadedNativeDeps = false;
+			if (!(await fileExists(nativeDepsTarPath))) {
+				console.log(`Downloading ${nativeDepsTar}`);
+				const bytes = await fetch(`${NATIVE_DEPS_URL}/${nativeDepsTar}`)
+					.then((r) => r.blob())
+					.then((b) => b.arrayBuffer());
+				await fs.writeFile(nativeDepsTarPath, Buffer.from(bytes));
+				console.log("Downloaded native deps");
+				downloadedNativeDeps = true;
+			} else console.log(`Using cached ${nativeDepsTar}`);
+
+			const nativeDepsDir = path.join(targetDir, "native-deps");
+			const nativeLibDir = path.join(nativeDepsDir, "lib");
+			if (downloadedNativeDeps || !(await fileExists(nativeLibDir))) {
+				await fs
+					.rm(nativeDepsDir, { recursive: true, force: true })
+					.catch(() => {});
+				await fs.mkdir(nativeDepsDir, { recursive: true });
+				await execFile("tar", ["xf", nativeDepsTarPath, "-C", nativeDepsDir]);
+				console.log("Extracted native-deps");
+			} else console.log("Using cached native-deps");
+
+			const debLibDir = path.join(nativeDepsDir, "cap-deb-libs");
+			await fs.rm(debLibDir, { recursive: true, force: true }).catch(() => {});
+			await fs.mkdir(debLibDir, { recursive: true });
+
+			const profileDirs = [];
+			for (const profile of ["debug", "release"]) {
+				profileDirs.push(path.join(targetDir, profile));
+				profileDirs.push(path.join(targetDir, triple, profile));
+			}
+			for (const dir of profileDirs) await fs.mkdir(dir, { recursive: true });
+
+			const sonameLibs = (await fs.readdir(nativeLibDir)).filter((name) =>
+				/\.so\.\d+$/.test(name),
+			);
+			for (const name of sonameLibs) {
+				const realPath = await fs.realpath(path.join(nativeLibDir, name));
+				await fs.copyFile(realPath, path.join(debLibDir, name));
+				for (const dir of profileDirs)
+					await fs.copyFile(realPath, path.join(dir, name));
+			}
+			console.log(
+				`Staged ${sonameLibs.length} FFmpeg shared libraries for Linux bundling`,
+			);
+			await writeLinuxTauriConfig(sonameLibs);
+
+			cargoConfigContents += `\n[target.${triple}]\nrustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN", "-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib/cap"]\n`;
+		}
 	}
 
 	await fs.mkdir(path.join(__root, ".cargo"), { recursive: true });
@@ -327,6 +412,81 @@ async function setupMacOSOnnxRuntime() {
 	return outputPath;
 }
 
+async function setupWindowsOnnxRuntime() {
+	const assets = {
+		x86_64: {
+			version: "1.24.2",
+			name: "onnxruntime-win-x64-1.24.2.zip",
+		},
+		aarch64: {
+			version: "1.24.2",
+			name: "onnxruntime-win-arm64-1.24.2.zip",
+		},
+	};
+	const asset = assets[arch];
+	if (!asset)
+		throw new Error(`Unsupported Windows arch for ONNX Runtime: ${arch}`);
+
+	const url = `https://github.com/microsoft/onnxruntime/releases/download/v${asset.version}/${asset.name}`;
+	const archivePath = path.join(targetDir, asset.name);
+	const extractDir = path.join(targetDir, asset.name.replace(/\.zip$/, ""));
+	const outputDir = path.join(targetDir, "native-deps", "onnxruntime", "lib");
+	const outputPath = path.join(outputDir, "onnxruntime.dll");
+	const markerPath = path.join(outputDir, "asset.txt");
+	const marker = await fs
+		.readFile(markerPath, "utf-8")
+		.then((value) => value.trim())
+		.catch(() => null);
+
+	if (!(await fileExists(archivePath))) {
+		console.log(`Downloading ${asset.name}`);
+		const bytes = await fetch(url)
+			.then((r) => r.blob())
+			.then((b) => b.arrayBuffer());
+		await fs.writeFile(archivePath, Buffer.from(bytes));
+		console.log(`Downloaded ${asset.name}`);
+	} else console.log(`Using cached ${asset.name}`);
+
+	if (!(await fileExists(outputPath)) || marker !== asset.name) {
+		await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+		await exec(
+			`Expand-Archive -Path "${archivePath}" -DestinationPath "${targetDir}" -Force`,
+			{ shell: "powershell.exe" },
+		);
+		await fs.rm(outputDir, { recursive: true, force: true }).catch(() => {});
+		await fs.mkdir(outputDir, { recursive: true });
+		const libDir = path.join(extractDir, "lib");
+		const dllNames = (await fs.readdir(libDir)).filter((name) =>
+			name.toLowerCase().endsWith(".dll"),
+		);
+		if (!dllNames.includes("onnxruntime.dll"))
+			throw new Error(`ONNX Runtime archive is missing onnxruntime.dll`);
+
+		for (const name of dllNames) {
+			await fs.copyFile(path.join(libDir, name), path.join(outputDir, name));
+		}
+		await fs.writeFile(markerPath, asset.name);
+		console.log("Prepared ONNX Runtime DLLs");
+	} else console.log("Using cached ONNX Runtime DLLs");
+
+	const dllNames = (await fs.readdir(outputDir)).filter((name) =>
+		name.toLowerCase().endsWith(".dll"),
+	);
+	for (const profile of ["debug", "release"]) {
+		const profileDir = path.join(targetDir, profile);
+		await fs.mkdir(profileDir, { recursive: true });
+		for (const name of dllNames) {
+			await fs.copyFile(
+				path.join(outputDir, name),
+				path.join(profileDir, name),
+			);
+		}
+	}
+	console.log("Copied ONNX Runtime DLLs to target/debug and target/release");
+
+	return outputPath;
+}
+
 async function writeFileIfChanged(filePath, contents) {
 	const currentContents = await fs
 		.readFile(filePath, "utf-8")
@@ -350,6 +510,30 @@ async function fileExists(path) {
 		.access(path)
 		.then(() => true)
 		.catch(() => false);
+}
+
+async function writeLinuxTauriConfig(sonameLibs) {
+	const configPath = path.join(
+		__root,
+		"apps",
+		"desktop",
+		"src-tauri",
+		"tauri.linux.conf.json",
+	);
+	const files = {};
+
+	for (const name of sonameLibs.toSorted()) {
+		files[`/usr/lib/cap/${name}`] =
+			`../../../target/native-deps/cap-deb-libs/${name}`;
+	}
+
+	await writeFileIfChanged(
+		configPath,
+		`${JSON.stringify({ bundle: { linux: { deb: { files } } } }, null, "\t")}\n`,
+	);
+	console.log(
+		`Generated Linux Tauri deb config with ${sonameLibs.length} shared libraries`,
+	);
 }
 
 async function missingFiles(dir, names) {

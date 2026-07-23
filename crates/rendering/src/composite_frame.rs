@@ -84,8 +84,14 @@ pub struct CompositeVideoFrameUniforms {
     pub opacity: f32,
     pub border_enabled: f32,
     pub border_width: f32,
-    pub _padding1: [f32; 4],
+    pub preserve_source_alpha: f32,
+    pub _padding1: [f32; 3],
     pub border_color: [f32; 4],
+    /// Per-corner multipliers on `rounding_px` (top-left, top-right,
+    /// bottom-left, bottom-right). All 1s = uniform rounding; the display
+    /// squares its top corners against decorative frame chrome with
+    /// `[0, 0, 1, 1]`.
+    pub corner_radii: [f32; 4],
 }
 
 impl Default for CompositeVideoFrameUniforms {
@@ -109,8 +115,10 @@ impl Default for CompositeVideoFrameUniforms {
             opacity: 1.0,
             border_enabled: 0.0,
             border_width: 5.0,
-            _padding1: [0.0; 4],
+            preserve_source_alpha: 0.0,
+            _padding1: [0.0; 3],
             border_color: [0.0, 0.0, 0.0, 0.0],
+            corner_radii: [1.0; 4],
         }
     }
 }
