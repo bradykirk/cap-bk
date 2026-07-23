@@ -26,6 +26,12 @@ interface TrackPayload {
 }
 
 const VIEW_TRACKING_DELAY_MS = 2 * 60 * 1000;
+const STALE_UPLOAD_MS = 30 * 60 * 1000;
+const ACTIVE_UPLOAD_PHASES = new Set([
+	"uploading",
+	"processing",
+	"generating_thumbnail",
+]);
 
 const sanitizeString = (value?: string | null) => {
 	const trimmed = value?.trim();
@@ -120,6 +126,8 @@ export async function POST(request: NextRequest) {
 						createdAt: videos.createdAt,
 						updatedAt: videos.updatedAt,
 						activeUploadVideoId: videoUploads.videoId,
+						activeUploadPhase: videoUploads.phase,
+						activeUploadUpdatedAt: videoUploads.updatedAt,
 					})
 					.from(videos)
 					.leftJoin(videoUploads, eq(videoUploads.videoId, videos.id))
@@ -135,6 +143,8 @@ export async function POST(request: NextRequest) {
 							createdAt: Date;
 							updatedAt: Date;
 							activeUploadVideoId: string | null;
+							activeUploadPhase: string | null;
+							activeUploadUpdatedAt: Date | null;
 						}[],
 				),
 			);
@@ -143,9 +153,16 @@ export async function POST(request: NextRequest) {
 				return;
 			}
 
+			const uploadInFlight =
+				videoRecord?.activeUploadVideoId != null &&
+				ACTIVE_UPLOAD_PHASES.has(videoRecord.activeUploadPhase ?? "") &&
+				videoRecord.activeUploadUpdatedAt != null &&
+				Date.now() - videoRecord.activeUploadUpdatedAt.getTime() <
+					STALE_UPLOAD_MS;
+
 			if (
 				videoRecord &&
-				(videoRecord.activeUploadVideoId ||
+				(uploadInFlight ||
 					Date.now() - videoRecord.updatedAt.getTime() < VIEW_TRACKING_DELAY_MS)
 			) {
 				return;
