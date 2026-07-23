@@ -1,6 +1,11 @@
 import { promises as fs } from "node:fs";
 import { db } from "@cap/database";
-import { organizations, videos, videoUploads } from "@cap/database/schema";
+import {
+	organizations,
+	s3Buckets,
+	videos,
+	videoUploads,
+} from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
