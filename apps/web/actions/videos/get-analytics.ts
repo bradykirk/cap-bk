@@ -78,23 +78,26 @@ export async function getVideoAnalytics(
 					}),
 				);
 
+			const extractCount = (data: readonly unknown[]) => {
+				const firstItem = data[0];
+				const value =
+					typeof firstItem === "number"
+						? firstItem
+						: typeof firstItem === "object" &&
+								firstItem !== null &&
+								"views" in firstItem
+							? Number((firstItem as { views: unknown }).views ?? 0)
+							: 0;
+				return Number.isFinite(value) ? value : 0;
+			};
+
 			const aggregateResult = yield* querySql(aggregateSql);
+			const aggregateCount = extractCount(aggregateResult.data ?? []);
 
-			const fallbackResult = aggregateResult.data?.length
-				? aggregateResult
-				: yield* querySql(rawSql);
+			if (aggregateCount > 0) return { count: aggregateCount };
 
-			const data = fallbackResult?.data ?? [];
-			const firstItem = data[0];
-			const count =
-				typeof firstItem === "number"
-					? firstItem
-					: typeof firstItem === "object" &&
-							firstItem !== null &&
-							"views" in firstItem
-						? Number(firstItem.views ?? 0)
-						: 0;
-			return { count: Number.isFinite(count) ? count : 0 };
+			const rawResult = yield* querySql(rawSql);
+			return { count: extractCount(rawResult.data ?? []) };
 		}),
 	);
 }

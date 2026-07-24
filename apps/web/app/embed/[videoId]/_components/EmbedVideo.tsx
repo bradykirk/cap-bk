@@ -14,6 +14,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { trackVideoView } from "@/lib/track-video-view";
 import { CapVideoPlayer } from "@/app/s/[videoId]/_components/CapVideoPlayer";
 import { HLSVideoPlayer } from "@/app/s/[videoId]/_components/HLSVideoPlayer";
 import { useUploadProgress } from "@/app/s/[videoId]/_components/ProgressCircle";
@@ -64,7 +65,7 @@ export const EmbedVideo = forwardRef<
 	(
 		{
 			data,
-			user: _user,
+			user,
 			comments: _comments,
 			chapters = [],
 			ownerName,
@@ -76,6 +77,17 @@ export const EmbedVideo = forwardRef<
 	) => {
 		const videoRef = useRef<HTMLVideoElement>(null);
 		useImperativeHandle(ref, () => videoRef.current as HTMLVideoElement);
+
+		const viewerId = user?.id ?? null;
+		useEffect(() => {
+			if (viewerId && viewerId === data.ownerId) return;
+
+			trackVideoView({
+				videoId: data.id,
+				orgId: data.orgId,
+				ownerId: data.ownerId,
+			});
+		}, [data.id, data.orgId, data.ownerId, viewerId]);
 
 		const [transcriptData, setTranscriptData] = useState<TranscriptEntry[]>([]);
 		const [longestDuration, setLongestDuration] = useState<number>(
