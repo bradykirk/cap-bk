@@ -6,6 +6,14 @@ import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
+import {
+	type Chapter,
+	formatTimestampLabel,
+	formatTranscriptWithTimestamps,
+	parseVttWithTimestamps,
+	sanitizeChapters,
+	type VttSegment,
+} from "@/lib/ai-transcript";
 import { GROQ_MODEL, getGroqClient } from "@/lib/groq-client";
 import { runPromise } from "@/lib/server";
 
@@ -20,20 +28,20 @@ interface VideoData {
 	metadata: VideoMetadata;
 }
 
-interface VttSegment {
-	start: number;
-	text: string;
-}
-
 interface TranscriptData {
 	segments: VttSegment[];
-	text: string;
+}
+
+interface TranscriptChunk {
+	segments: VttSegment[];
+	startTime: number;
+	endTime: number;
 }
 
 interface AiResult {
 	title?: string;
 	summary?: string;
-	chapters?: { title: string; start: number }[];
+	chapters?: Chapter[];
 }
 
 const MAX_CHARS_PER_CHUNK = 24000;
@@ -41,7 +49,10 @@ const MAX_CHARS_PER_CHUNK = 24000;
 export async function startAiGeneration(
 	videoId: Video.VideoId,
 	userId: string,
+	options: { force?: boolean } = {},
 ): Promise<GenerateAiResult> {
+	const force = options.force === true;
+
 	if (!serverEnv().GROQ_API_KEY && !serverEnv().OPENAI_API_KEY) {
 		return {
 			success: false,
@@ -87,6 +98,7 @@ export async function startAiGeneration(
 	}
 
 	if (
+		!force &&
 		metadata.aiGenerationStatus === "COMPLETE" &&
 		metadata.summary &&
 		metadata.chapters
@@ -97,7 +109,9 @@ export async function startAiGeneration(
 		};
 	}
 
-	console.log(`[startAiGeneration] Starting AI generation for video ${videoId}`);
+	console.log(
+		`[startAiGeneration] Starting AI generation for video ${videoId}`,
+	);
 
 	await db()
 		.update(videos)
@@ -110,7 +124,7 @@ export async function startAiGeneration(
 		.where(eq(videos.id, videoId));
 
 	Promise.resolve().then(() =>
-		executeAiGenerationAsync(videoId, userId).catch((error) => {
+		executeAiGenerationAsync(videoId, userId, force).catch((error) => {
 			console.error(
 				`[startAiGeneration] Async AI generation failed for ${videoId}:`,
 				error,
@@ -127,11 +141,16 @@ export async function startAiGeneration(
 async function executeAiGenerationAsync(
 	videoId: Video.VideoId,
 	userId: string,
+	force: boolean,
 ): Promise<void> {
 	try {
-		const videoData = await validateAndSetProcessing(videoId);
+		const videoData = await validateAndSetProcessing(videoId, force);
 
-		const transcript = await fetchTranscript(videoId, userId, videoData.bucketId);
+		const transcript = await fetchTranscript(
+			videoId,
+			userId,
+			videoData.bucketId,
+		);
 
 		if (!transcript) {
 			await markSkipped(videoId, videoData.metadata);
@@ -141,7 +160,7 @@ async function executeAiGenerationAsync(
 			return;
 		}
 
-		const result = await generateWithAi(transcript);
+		const result = await generateWithAi(transcript, videoData.video.duration);
 
 		await saveResults(videoId, videoData, result);
 
@@ -149,14 +168,17 @@ async function executeAiGenerationAsync(
 			`[startAiGeneration] AI generation completed successfully for ${videoId}`,
 		);
 	} catch (error) {
-		console.error(`[startAiGeneration] AI generation failed for ${videoId}:`, error);
+		console.error(
+			`[startAiGeneration] AI generation failed for ${videoId}:`,
+			error,
+		);
 
 		const query = await db()
 			.select({ video: videos })
 			.from(videos)
 			.where(eq(videos.id, videoId));
 
-		const metadata = ((query[0]?.video?.metadata as VideoMetadata) || {});
+		const metadata = (query[0]?.video?.metadata as VideoMetadata) || {};
 
 		await db()
 			.update(videos)
@@ -170,7 +192,10 @@ async function executeAiGenerationAsync(
 	}
 }
 
-async function validateAndSetProcessing(videoId: Video.VideoId): Promise<VideoData> {
+async function validateAndSetProcessing(
+	videoId: Video.VideoId,
+	force: boolean,
+): Promise<VideoData> {
 	const groqClient = getGroqClient();
 	if (!groqClient && !serverEnv().OPENAI_API_KEY) {
 		throw new Error("Missing Groq or OpenAI API key");
@@ -193,7 +218,7 @@ async function validateAndSetProcessing(videoId: Video.VideoId): Promise<VideoDa
 		throw new Error("Transcription not complete");
 	}
 
-	if (metadata.summary && metadata.chapters) {
+	if (!force && metadata.summary && metadata.chapters) {
 		throw new Error("AI metadata already generated");
 	}
 
@@ -240,7 +265,7 @@ async function fetchTranscript(
 		return null;
 	}
 
-	return { segments, text };
+	return { segments };
 }
 
 async function markSkipped(
@@ -258,15 +283,35 @@ async function markSkipped(
 		.where(eq(videos.id, videoId));
 }
 
-async function generateWithAi(transcript: TranscriptData): Promise<AiResult> {
+async function generateWithAi(
+	transcript: TranscriptData,
+	durationSeconds: number | null,
+): Promise<AiResult> {
 	const groqClient = getGroqClient();
+	const maxTime = resolveMaxTime(transcript.segments, durationSeconds);
 	const chunks = chunkTranscriptWithTimestamps(transcript.segments);
 
-	if (chunks.length === 1) {
-		return generateSingleChunk(transcript.text, groqClient);
+	if (chunks.length <= 1) {
+		return generateSingleChunk(transcript.segments, groqClient, maxTime);
 	}
 
-	return generateMultipleChunks(chunks, groqClient);
+	return generateMultipleChunks(chunks, groqClient, maxTime);
+}
+
+function resolveMaxTime(
+	segments: VttSegment[],
+	durationSeconds: number | null,
+): number | null {
+	if (
+		typeof durationSeconds === "number" &&
+		Number.isFinite(durationSeconds) &&
+		durationSeconds > 0
+	) {
+		return Math.ceil(durationSeconds);
+	}
+
+	const lastSegmentStart = segments[segments.length - 1]?.start ?? 0;
+	return lastSegmentStart > 0 ? lastSegmentStart : null;
 }
 
 async function saveResults(
@@ -304,51 +349,27 @@ async function saveResults(
 	}
 }
 
-function parseVttWithTimestamps(vttContent: string): VttSegment[] {
-	const lines = vttContent.split("\n");
-	const segments: VttSegment[] = [];
-	let currentStart = 0;
-
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i]?.trim() ?? "";
-		if (line.includes("-->")) {
-			const timeMatch = line.match(/(\d{2}):(\d{2}):(\d{2})[.,](\d{3})/);
-			if (timeMatch) {
-				currentStart =
-					parseInt(timeMatch[1] ?? "0", 10) * 3600 +
-					parseInt(timeMatch[2] ?? "0", 10) * 60 +
-					parseInt(timeMatch[3] ?? "0", 10);
-			}
-		} else if (
-			line &&
-			line !== "WEBVTT" &&
-			!/^\d+$/.test(line) &&
-			!line.includes("-->")
-		) {
-			segments.push({ start: currentStart, text: line });
-		}
-	}
-
-	return segments;
-}
-
 function chunkTranscriptWithTimestamps(
 	segments: VttSegment[],
-): { text: string; startTime: number; endTime: number }[] {
-	const chunks: { text: string; startTime: number; endTime: number }[] = [];
+): TranscriptChunk[] {
+	const chunks: TranscriptChunk[] = [];
 	let currentChunk: VttSegment[] = [];
 	let currentLength = 0;
+
+	const pushChunk = () => {
+		chunks.push({
+			segments: currentChunk,
+			startTime: currentChunk[0]?.start ?? 0,
+			endTime: currentChunk[currentChunk.length - 1]?.start ?? 0,
+		});
+	};
 
 	for (const segment of segments) {
 		if (
 			currentLength + segment.text.length > MAX_CHARS_PER_CHUNK &&
 			currentChunk.length > 0
 		) {
-			chunks.push({
-				text: currentChunk.map((s) => s.text).join(" "),
-				startTime: currentChunk[0]?.start ?? 0,
-				endTime: currentChunk[currentChunk.length - 1]?.start ?? 0,
-			});
+			pushChunk();
 			currentChunk = [];
 			currentLength = 0;
 		}
@@ -357,11 +378,7 @@ function chunkTranscriptWithTimestamps(
 	}
 
 	if (currentChunk.length > 0) {
-		chunks.push({
-			text: currentChunk.map((s) => s.text).join(" "),
-			startTime: currentChunk[0]?.start ?? 0,
-			endTime: currentChunk[currentChunk.length - 1]?.start ?? 0,
-		});
+		pushChunk();
 	}
 
 	return chunks;
@@ -423,9 +440,22 @@ function cleanJsonResponse(content: string): string {
 	return content;
 }
 
+function chapterTimingRules(maxTime: number | null): string {
+	const bound =
+		maxTime === null
+			? ""
+			: `\n- The video is ${maxTime} seconds long (${formatTimestampLabel(maxTime)}). NEVER return a chapter with a start greater than ${maxTime}.`;
+
+	return `- Every transcript line is prefixed with its real timestamp as [MM:SS]
+- "start" MUST be the timestamp of the transcript line where that topic begins, converted to seconds (e.g. [01:40] becomes 100)
+- Only use timestamps that actually appear in the transcript. Do NOT estimate, round, or evenly space them
+- If you are unsure where a topic begins, omit the chapter rather than guessing${bound}`;
+}
+
 async function generateSingleChunk(
-	transcriptText: string,
+	segments: VttSegment[],
 	groqClient: ReturnType<typeof getGroqClient>,
+	maxTime: number | null,
 ): Promise<AiResult> {
 	const prompt = `You are Cap AI, an expert at analyzing video content and creating comprehensive summaries.
 
@@ -443,22 +473,26 @@ Guidelines:
 - Include specific details, names, numbers, and conclusions mentioned
 - Chapters should mark distinct topic changes or sections
 
+Chapter timing rules:
+${chapterTimingRules(maxTime)}
+
 Return ONLY valid JSON without any markdown formatting or code blocks.
 Transcript:
-${transcriptText}`;
+${formatTranscriptWithTimestamps(segments)}`;
 
 	const content = await callAiApi(prompt, groqClient);
-	return parseAiResponse(content);
+	return parseAiResponse(content, maxTime);
 }
 
 async function generateMultipleChunks(
-	chunks: { text: string; startTime: number; endTime: number }[],
+	chunks: TranscriptChunk[],
 	groqClient: ReturnType<typeof getGroqClient>,
+	maxTime: number | null,
 ): Promise<AiResult> {
 	const chunkSummaries: {
 		summary: string;
 		keyPoints: string[];
-		chapters: { title: string; start: number }[];
+		chapters: Chapter[];
 		startTime: number;
 		endTime: number;
 	}[] = [];
@@ -467,7 +501,7 @@ async function generateMultipleChunks(
 		const chunk = chunks[i];
 		if (!chunk) continue;
 
-		const chunkPrompt = `You are Cap AI, an expert at analyzing video content. This is section ${i + 1} of ${chunks.length} from a longer video (timestamp ${Math.floor(chunk.startTime / 60)}:${String(chunk.startTime % 60).padStart(2, "0")} to ${Math.floor(chunk.endTime / 60)}:${String(chunk.endTime % 60).padStart(2, "0")}).
+		const chunkPrompt = `You are Cap AI, an expert at analyzing video content. This is section ${i + 1} of ${chunks.length} from a longer video (timestamp ${formatTimestampLabel(chunk.startTime)} to ${formatTimestampLabel(chunk.endTime)}).
 
 Analyze this section thoroughly and provide JSON:
 {
@@ -476,10 +510,13 @@ Analyze this section thoroughly and provide JSON:
   "chapters": [{"title": "string (descriptive title for this topic/section)", "start": number (seconds from video start)}]
 }
 
+Chapter timing rules:
+${chapterTimingRules(maxTime)}
+
 Be thorough - this summary will be combined with other sections to create a comprehensive overview.
 Return ONLY valid JSON without any markdown formatting or code blocks.
 Transcript section:
-${chunk.text}`;
+${formatTranscriptWithTimestamps(chunk.segments)}`;
 
 		const chunkContent = await callAiApi(chunkPrompt, groqClient);
 		try {
@@ -487,29 +524,23 @@ ${chunk.text}`;
 			chunkSummaries.push({
 				summary: parsed.summary || "",
 				keyPoints: parsed.keyPoints || [],
-				chapters: parsed.chapters || [],
+				chapters: sanitizeChapters(parsed.chapters, maxTime),
 				startTime: chunk.startTime,
 				endTime: chunk.endTime,
 			});
 		} catch {}
 	}
 
-	const allChapters: { title: string; start: number }[] = [];
-	const sortedChapters = chunkSummaries
-		.flatMap((c) => c.chapters)
-		.sort((a, b) => a.start - b.start);
-	for (const chapter of sortedChapters) {
-		const lastChapter = allChapters[allChapters.length - 1];
-		if (!lastChapter || Math.abs(chapter.start - lastChapter.start) >= 30) {
-			allChapters.push(chapter);
-		}
-	}
+	const allChapters = sanitizeChapters(
+		chunkSummaries.flatMap((c) => c.chapters),
+		maxTime,
+	);
 
 	const allKeyPoints = chunkSummaries.flatMap((c) => c.keyPoints);
 
 	const sectionDetails = chunkSummaries
 		.map((c, i) => {
-			const timeRange = `${Math.floor(c.startTime / 60)}:${String(c.startTime % 60).padStart(2, "0")} - ${Math.floor(c.endTime / 60)}:${String(c.endTime % 60).padStart(2, "0")}`;
+			const timeRange = `${formatTimestampLabel(c.startTime)} - ${formatTimestampLabel(c.endTime)}`;
 			const keyPointsList =
 				c.keyPoints.length > 0 ? `\nKey points: ${c.keyPoints.join("; ")}` : "";
 			return `Section ${i + 1} (${timeRange}):\n${c.summary}${keyPointsList}`;
@@ -558,28 +589,14 @@ Return ONLY valid JSON without any markdown formatting or code blocks.`;
 	}
 }
 
-function parseAiResponse(content: string): AiResult {
+function parseAiResponse(content: string, maxTime: number | null): AiResult {
 	try {
 		const data = JSON.parse(cleanJsonResponse(content).trim());
-
-		if (data.chapters && data.chapters.length > 0) {
-			const sortedChapters = data.chapters.sort(
-				(a: { start: number }, b: { start: number }) => a.start - b.start,
-			);
-			const dedupedChapters: { title: string; start: number }[] = [];
-			for (const chapter of sortedChapters) {
-				const lastChapter = dedupedChapters[dedupedChapters.length - 1];
-				if (!lastChapter || Math.abs(chapter.start - lastChapter.start) >= 30) {
-					dedupedChapters.push(chapter);
-				}
-			}
-			data.chapters = dedupedChapters;
-		}
 
 		return {
 			title: data.title,
 			summary: data.summary,
-			chapters: data.chapters,
+			chapters: sanitizeChapters(data.chapters, maxTime),
 		};
 	} catch {
 		return {

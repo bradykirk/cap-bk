@@ -11,11 +11,26 @@ import { isAiGenerationEnabled } from "@/utils/flags";
 const LEGACY_AI_SUMMARY_FALLBACK =
 	"The AI was unable to generate a proper summary for this content.";
 
+async function parseForceFlag(request: Request): Promise<boolean> {
+	if (new URL(request.url).searchParams.get("force") === "true") {
+		return true;
+	}
+
+	try {
+		const body = await request.json();
+		return body?.force === true;
+	} catch {
+		return false;
+	}
+}
+
 export async function POST(
-	_request: Request,
+	request: Request,
 	props: RouteContext<"/api/videos/[videoId]/retry-ai">,
 ) {
 	try {
+		const force = await parseForceFlag(request);
+
 		const user = await getCurrentUser();
 		if (!user) {
 			return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -53,18 +68,24 @@ export async function POST(
 
 		const metadata = (video.metadata as VideoMetadata) || {};
 
+		const isInProgress =
+			metadata.aiGenerationStatus === "QUEUED" ||
+			metadata.aiGenerationStatus === "PROCESSING";
+
 		const canRetry =
 			!metadata.aiGenerationStatus ||
 			metadata.aiGenerationStatus === "ERROR" ||
 			metadata.aiGenerationStatus === "SKIPPED" ||
 			(metadata.aiGenerationStatus === "COMPLETE" &&
-				metadata.summary === LEGACY_AI_SUMMARY_FALLBACK);
+				metadata.summary === LEGACY_AI_SUMMARY_FALLBACK) ||
+			(force && !isInProgress);
 
 		if (!canRetry) {
 			return Response.json(
 				{
-					error:
-						"AI generation is already in progress or completed. Cannot retry.",
+					error: isInProgress
+						? "AI generation is already in progress. Cannot retry."
+						: "AI generation already completed. Retry with force to regenerate.",
 					aiGenerationStatus: metadata.aiGenerationStatus,
 				},
 				{ status: 400 },
@@ -94,7 +115,7 @@ export async function POST(
 			);
 		}
 
-		const result = await startAiGeneration(videoId, video.ownerId);
+		const result = await startAiGeneration(videoId, video.ownerId, { force });
 
 		if (!result.success) {
 			return Response.json({ error: result.message }, { status: 500 });

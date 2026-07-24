@@ -21,6 +21,7 @@ import {
 	type VideoStatusResult,
 } from "@/actions/videos/get-status";
 import type { OrganizationSettings } from "@/app/(org)/dashboard/dashboard-data";
+import { sanitizeChapters } from "@/lib/ai-transcript";
 import { trackVideoView } from "@/lib/track-video-view";
 import { CaptionProvider } from "./_components/CaptionContext";
 import { ShareVideo } from "./_components/ShareVideo";
@@ -230,15 +231,15 @@ export const Share = ({
 	const transcriptionStatus =
 		videoStatus?.transcriptionStatus || data.transcriptionStatus;
 
-	const aiData = useMemo(
-		() => ({
+	const aiData = useMemo(() => {
+		const chapters = sanitizeChapters(videoStatus?.chapters, data.duration);
+		return {
 			title: videoStatus?.aiTitle || null,
 			summary: videoStatus?.summary || null,
-			chapters: videoStatus?.chapters || null,
+			chapters: chapters.length > 0 ? chapters : null,
 			aiGenerationStatus: videoStatus?.aiGenerationStatus || null,
-		}),
-		[videoStatus],
-	);
+		};
+	}, [videoStatus, data.duration]);
 
 	useEffect(() => {
 		if (viewerId && viewerId === data.owner.id) {
@@ -289,7 +290,9 @@ export const Share = ({
 		}
 
 		if (!transcriptionStatus) {
-			return transcriptionGenerationAvailable && !unstartedTranscriptionTimedOut;
+			return (
+				transcriptionGenerationAvailable && !unstartedTranscriptionTimedOut
+			);
 		}
 
 		if (transcriptionStatus === "PROCESSING") {

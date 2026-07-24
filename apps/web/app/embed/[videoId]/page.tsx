@@ -24,6 +24,7 @@ import { Effect, Option } from "effect";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { sanitizeChapters } from "@/lib/ai-transcript";
 import * as EffectRuntime from "@/lib/server";
 import { transcribeVideo } from "@/lib/transcribe";
 import { isAiGenerationEnabled } from "@/utils/flags";
@@ -274,10 +275,11 @@ async function EmbedContent({
 		currentMetadata.chapters ||
 		currentMetadata.aiTitle
 	) {
+		const chapters = sanitizeChapters(currentMetadata.chapters, video.duration);
 		initialAiData = {
 			title: currentMetadata.aiTitle || null,
 			summary: currentMetadata.summary || null,
-			chapters: currentMetadata.chapters || null,
+			chapters: chapters.length > 0 ? chapters : null,
 		};
 	}
 
