@@ -92,6 +92,10 @@ function createServerEnv() {
 			DEEPGRAM_API_KEY: z.string().optional().describe("Audio transcription"),
 			ANTHROPIC_API_KEY: z.string().optional().describe("AI chat"),
 			OPENAI_API_KEY: z.string().optional().describe("AI summaries"),
+			OPENAI_BASE_URL: z
+				.string()
+				.optional()
+				.describe("OpenAI-compatible endpoint for AI summaries"),
 			GROQ_API_KEY: z.string().optional().describe("AI summaries"),
 			REPLICATE_API_TOKEN: z
 				.string()

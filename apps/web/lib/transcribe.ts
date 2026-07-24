@@ -22,6 +22,8 @@ import {
 import { runPromise } from "@/lib/server";
 import { type DeepgramResult, formatToWebVTT } from "@/lib/transcribe-utils";
 
+const STALE_UPLOAD_MS = 30 * 60 * 1000;
+
 type TranscribeResult = {
 	success: boolean;
 	message: string;
@@ -116,20 +118,31 @@ export async function transcribeVideo(
 	}
 
 	const upload = await db()
-		.select({ phase: videoUploads.phase })
+		.select({ phase: videoUploads.phase, updatedAt: videoUploads.updatedAt })
 		.from(videoUploads)
 		.where(eq(videoUploads.videoId, videoId))
 		.limit(1);
 
-	if (
-		upload[0]?.phase === "uploading" ||
-		upload[0]?.phase === "processing" ||
-		upload[0]?.phase === "generating_thumbnail"
-	) {
+	const uploadRow = upload[0];
+	const uploadPhaseActive =
+		uploadRow?.phase === "uploading" ||
+		uploadRow?.phase === "processing" ||
+		uploadRow?.phase === "generating_thumbnail";
+	const uploadRecent =
+		uploadRow?.updatedAt != null &&
+		Date.now() - uploadRow.updatedAt.getTime() < STALE_UPLOAD_MS;
+
+	if (uploadPhaseActive && uploadRecent) {
 		return {
 			success: true,
 			message: "Video upload is still in progress",
 		};
+	}
+
+	if (uploadPhaseActive && !uploadRecent) {
+		console.warn(
+			`[transcribeVideo] Ignoring stale ${uploadRow?.phase} upload row for ${videoId}`,
+		);
 	}
 
 	console.log(`[transcribeVideo] Starting transcription for video ${videoId}`);
