@@ -62,12 +62,38 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 
 **Description:** Fixes folder color rendering (direct Rive `src` loading) and a New Folder / Subfolder dialog crash caused by a Rive animation race condition. Upstream has not changed these files, so the fixes are carried forward verbatim.
 
+### 7. Rive Assets Excluded From The Proxy
+
+**File:** `apps/web/proxy.ts`
+
+**Description:** `proxy.ts` (formerly `middleware.ts`, renamed in Next.js 16) rewrites requests for custom-domain routing. Its matcher must exclude `rive`, or `/rive/*` returns HTML instead of the asset and every folder icon and colour renders blank. Symptom: `WebAssembly.instantiate(): expected magic word 00 61 73 6d, found 3c 21 44 4f`.
+
+**On each sync:** verify `rive` is still present in the matcher's negative lookahead, and check whether the file has been renamed again.
+
+### 8. Self-Hosted Rive WASM Must Match The Installed Runtime
+
+**File:** `apps/web/public/rive/rive.wasm`
+
+**Description:** `apps/web/lib/rive.ts` pins `RuntimeLoader.setWasmUrl("/rive/rive.wasm")`, but `apps/web/package.json` floats `@rive-app/react-canvas` on a caret range. When the lockfile resolves a newer runtime, the committed binary no longer matches the JS glue and Rive fails to initialise.
+
+**On each sync:** re-copy the binary from the resolved package.
+
+```bash
+cp node_modules/.pnpm/@rive-app+canvas@*/node_modules/@rive-app/canvas/rive.wasm apps/web/public/rive/rive.wasm
+```
+
+## Deploying
+
+1. Apply database migrations **before** the new image goes live. The app runs Drizzle migrations at startup; they are journal-based, so never apply migration SQL by hand — doing so desyncs `__drizzle_migrations` and every subsequent boot fails with `ER_DUP_KEYNAME` or similar.
+2. Push to `self-hosted`. The workflow typechecks, then builds and publishes `ghcr.io/bradykirk/cap-web:latest`.
+3. Redeploy the app in Coolify to pull the new image.
+
 ## Customizations Removed During 2026-05-29 Sync
 
 These earlier customizations were dropped because upstream has since adopted equivalent fixes, or the code they patched no longer exists:
 
 - **`apps/web/lib/audio-extract.ts`** (FFmpeg path resolution) — upstream now includes `/usr/bin/ffmpeg` in its candidate paths and logs when FFmpeg is missing.
-- **`apps/web/middleware.ts`** (`rive` matcher exclusion) — the middleware file was removed upstream, so the exclusion is moot.
+- ~~**`apps/web/middleware.ts`** (`rive` matcher exclusion) — the middleware file was removed upstream, so the exclusion is moot.~~ **Wrong.** Next.js 16 renamed `middleware.ts` to `proxy.ts`; the interception returned under a new filename and broke all Rive graphics on custom domains. Re-applied — see customization 7.
 - **`apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx`** (thumbnail error fix) — upstream now guards thumbnails with `supportsCrossOrigin` and no longer uses the `placeholder.pics` error image.
 - **`packages/database/emails/config.ts`** (`replyTo`) — upstream now uses the camelCase `replyTo` key.
 - **Desktop / Rust adaptations** (`CameraSelect.tsx`, `in-progress-recording.tsx`, `window-capture-occluder.tsx`, `crates/cap-test/.../recording.rs`) — these were one-off adaptations to in-flight upstream API changes at the original fork point. They do not ship in the `cap-web` image and the relevant APIs have since changed upstream.
