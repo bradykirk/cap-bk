@@ -38,6 +38,42 @@ export async function register() {
 	// Add a timeout to trigger migrations after 5 seconds on server start
 	setTimeout(() => triggerMigrations(), 5000);
 	setTimeout(() => createS3Bucket(), 5000);
+	startMaintenanceScheduler();
+}
+
+const MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
+const MAINTENANCE_FIRST_RUN_DELAY_MS = 2 * 60 * 1000;
+
+function startMaintenanceScheduler() {
+	if (process.env.DISABLE_SELF_HOSTED_MAINTENANCE === "true") return;
+
+	let running = false;
+
+	const runMaintenance = async () => {
+		if (running) return;
+		running = true;
+		try {
+			const [{ recoverStalledVideoPipeline }, { recoverFailedVideoProcessing }] =
+				await Promise.all([
+					import("@/lib/video-pipeline-recovery"),
+					import("@/lib/video-processing-recovery"),
+				]);
+
+			const [processing, pipeline] = await Promise.all([
+				recoverFailedVideoProcessing(),
+				recoverStalledVideoPipeline(),
+			]);
+
+			console.log("🧹 Maintenance sweep complete", { processing, pipeline });
+		} catch (error) {
+			console.error("🚨 Maintenance sweep failed:", error);
+		} finally {
+			running = false;
+		}
+	};
+
+	setTimeout(runMaintenance, MAINTENANCE_FIRST_RUN_DELAY_MS);
+	setInterval(runMaintenance, MAINTENANCE_INTERVAL_MS).unref?.();
 }
 
 async function createS3Bucket() {
