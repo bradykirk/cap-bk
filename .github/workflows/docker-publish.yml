@@ -11,7 +11,24 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/cap-web
 
 jobs:
+  verify:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-js
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test (advisory until known failures are resolved)
+        continue-on-error: true
+        run: pnpm --dir apps/web test
+
   build-and-push:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
