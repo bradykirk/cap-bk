@@ -33,7 +33,6 @@ const formatDate = (date: Date) => date.toISOString().slice(0, 10);
 const formatDateTime = (date: Date) =>
 	date.toISOString().slice(0, 19).replace("T", " ");
 const buildPathname = (videoId: Video.VideoId) => `/s/${videoId}`;
-const buildEmbedPathname = (videoId: Video.VideoId) => `/embed/${videoId}`;
 // Embedded players record hits under /embed/<id>; fold them into /s/<id> so
 // each video's sessions are merged across both paths.
 const VIDEO_PATH_SQL = "replaceRegexpOne(pathname, '^/embed/', '/s/')";
@@ -154,7 +153,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 
 				const videosByOrg = new Map<
 					string,
-					Array<{ videoId: Video.VideoId; pathnames: string[] }>
+					Array<{ videoId: Video.VideoId; pathname: string }>
 				>();
 				for (const video of analyticsVideos) {
 					const key = video.orgId;
@@ -165,10 +164,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					if (entries) {
 						entries.push({
 							videoId: video.id,
-							pathnames: [
-								buildPathname(video.id),
-								buildEmbedPathname(video.id),
-							],
+							pathname: buildPathname(video.id),
 						});
 					}
 				}
@@ -190,7 +186,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					);
 
 				for (const [orgKey, entries] of videosByOrg) {
-					const pathnames = entries.flatMap((entry) => entry.pathnames);
+					const pathnames = entries.map((entry) => entry.pathname);
 					if (pathnames.length === 0) continue;
 
 					const escapedPathnames = pathnames
@@ -204,7 +200,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					const aggregateSql = `
 						SELECT ${VIDEO_PATH_SQL} AS video_path, coalesce(uniqMerge(visits), 0) AS views
 						FROM analytics_pages_mv
-						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
+						WHERE ${tenantCondition}${VIDEO_PATH_SQL} IN (${escapedPathnames})
 							AND date BETWEEN toDate('${formatDate(from)}') AND toDate('${formatDate(now)}')
 						GROUP BY video_path
 					`;
@@ -212,7 +208,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					const rawSql = `
 						SELECT ${VIDEO_PATH_SQL} AS video_path, coalesce(uniq(session_id), 0) AS views
 						FROM analytics_events
-						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
+						WHERE ${tenantCondition}${VIDEO_PATH_SQL} IN (${escapedPathnames})
 							AND action = 'page_hit'
 							AND timestamp BETWEEN toDateTime('${formatDateTime(from)}') AND toDateTime('${formatDateTime(now)}')
 						GROUP BY video_path

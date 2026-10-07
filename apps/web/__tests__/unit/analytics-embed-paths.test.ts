@@ -13,15 +13,15 @@ describe("buildPathnameFilter", () => {
 		expect(buildPathnameFilter([])).toBe("");
 	});
 
-	it("includes the share and embed path for each video", () => {
+	it("matches embed hits through the folded share path", () => {
 		expect(buildPathnameFilter(["abc", "def"] as never)).toBe(
-			"AND pathname IN ('/s/abc', '/embed/abc', '/s/def', '/embed/def')",
+			"AND replaceRegexpOne(pathname, '^/embed/', '/s/') IN ('/s/abc', '/s/def')",
 		);
 	});
 
 	it("escapes quotes and backslashes in IDs", () => {
 		expect(buildPathnameFilter(["a'b\\"] as never)).toBe(
-			"AND pathname IN ('/s/a''b\\\\', '/embed/a''b\\\\')",
+			"AND replaceRegexpOne(pathname, '^/embed/', '/s/') IN ('/s/a''b\\\\')",
 		);
 	});
 });

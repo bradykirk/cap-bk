@@ -63,14 +63,12 @@ export const buildPathnameFilter = (spaceVideoIds?: VideoId[]): string => {
 	if (!spaceVideoIds || spaceVideoIds.length === 0) {
 		return "";
 	}
-	// Embedded players record hits under /embed/<id>.
+	// Match the folded path so embed hits count without doubling the list,
+	// which keeps large spaces under Tinybird's SQL size limit.
 	const pathnames = spaceVideoIds
-		.flatMap((id) => [
-			`'/s/${escapeLiteral(id)}'`,
-			`'/embed/${escapeLiteral(id)}'`,
-		])
+		.map((id) => `'/s/${escapeLiteral(id)}'`)
 		.join(", ");
-	return `AND pathname IN (${pathnames})`;
+	return `AND ${VIDEO_PATH_SQL} IN (${pathnames})`;
 };
 
 const normalizeBucket = (
