@@ -296,6 +296,9 @@ export const Share = ({
 			title: videoStatus?.aiTitle || null,
 			summary: videoStatus?.summary || null,
 			chapters: chapters.length > 0 ? chapters : null,
+			// The editor's conflict check compares against the stored chapters,
+			// so it must start from them, not from the render-sanitized copy.
+			storedChapters: videoStatus?.chapters ?? null,
 			aiGenerationStatus: videoStatus?.aiGenerationStatus || null,
 		};
 	}, [videoStatus, data.duration]);

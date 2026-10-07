@@ -31,6 +31,7 @@ interface SummaryProps {
 		title?: string | null;
 		summary?: string | null;
 		chapters?: Chapter[] | null;
+		storedChapters?: Chapter[] | null;
 		aiGenerationStatus?: AiGenerationStatus | null;
 	};
 	aiGenerationEnabled?: boolean;
@@ -213,7 +214,7 @@ export const Summary: React.FC<SummaryProps> = ({
 				videoId={videoId}
 				initialContent={{
 					summary: aiData?.summary || "",
-					chapters: aiData?.chapters ?? [],
+					chapters: aiData?.storedChapters ?? aiData?.chapters ?? [],
 				}}
 				duration={duration}
 				onEditingStateChange={onEditingStateChange}

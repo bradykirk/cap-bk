@@ -54,10 +54,13 @@ export async function getVideoAnalytics(
 			const rangeDays = normalizeRangeDays(options?.rangeDays);
 			const now = new Date();
 			const from = new Date(now.getTime() - rangeDays * DAY_IN_MS);
-			const pathname = `/s/${videoId}`;
+			// Embedded players record views under /embed/<id>; count both.
+			const pathnames = [`/s/${videoId}`, `/embed/${videoId}`]
+				.map((pathname) => `'${escapeLiteral(pathname)}'`)
+				.join(", ");
 			const aggregateConditions = [
 				orgId ? `tenant_id = '${escapeLiteral(orgId)}'` : undefined,
-				`pathname = '${escapeLiteral(pathname)}'`,
+				`pathname IN (${pathnames})`,
 				`date BETWEEN toDate('${formatDate(from)}') AND toDate('${formatDate(now)}')`,
 			];
 			const aggregateSql = `SELECT coalesce(uniqMerge(visits), 0) AS views FROM analytics_pages_mv WHERE ${buildConditions(aggregateConditions)}`;
@@ -65,7 +68,7 @@ export async function getVideoAnalytics(
 			const rawConditions = [
 				"action = 'page_hit'",
 				orgId ? `tenant_id = '${escapeLiteral(orgId)}'` : undefined,
-				`pathname = '${escapeLiteral(pathname)}'`,
+				`pathname IN (${pathnames})`,
 				`timestamp BETWEEN toDateTime('${formatDateTime(from)}') AND toDateTime('${formatDateTime(now)}')`,
 			];
 			const rawSql = `SELECT coalesce(uniq(session_id), 0) AS views FROM analytics_events WHERE ${buildConditions(rawConditions)}`;

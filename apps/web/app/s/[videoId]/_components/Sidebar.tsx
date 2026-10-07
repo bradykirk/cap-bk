@@ -59,6 +59,7 @@ interface SidebarProps {
 		title?: string | null;
 		summary?: string | null;
 		chapters?: { title: string; start: number }[] | null;
+		storedChapters?: { title: string; start: number }[] | null;
 		aiGenerationStatus?: AiGenerationStatus | null;
 	} | null;
 	aiGenerationEnabled?: boolean;
