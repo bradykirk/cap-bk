@@ -66,9 +66,9 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 
 ### 7. View Tracking And Transcription Loading Timeout
 
-**Files:** `apps/web/lib/track-video-view.ts`, `apps/web/app/s/[videoId]/Share.tsx`, `apps/web/app/embed/[videoId]/_components/EmbedVideo.tsx`
+**Files:** `apps/web/lib/track-video-view.ts`, `apps/web/app/s/[videoId]/Share.tsx`, `apps/web/app/embed/[videoId]/_components/EmbedVideo.tsx`, `apps/web/actions/videos/get-analytics.ts`, `apps/web/app/(org)/dashboard/analytics/data.ts`, `packages/web-backend/src/Videos/index.ts`
 
-**Description:** The view tracker is shared by the share page and the embed player (upstream tracks only the share page). The share page stops showing the AI loading state after 5 minutes when transcription never starts.
+**Description:** The view tracker is shared by the share page and the embed player (upstream tracks only the share page). Embed hits are stored under `/embed/<id>`, so every view count (share page, dashboard cards, mobile/API, analytics reports, Top Caps) also reads that path and folds it into `/s/<id>` with `replaceRegexpOne`. The share page stops showing the AI loading state after 5 minutes when transcription never starts.
 
 ### 8. Rive Assets Excluded From The Proxy
 

@@ -56,12 +56,19 @@ const toDateString = (date: Date) => date.toISOString().slice(0, 10);
 const toDateTimeString = (date: Date) =>
 	date.toISOString().slice(0, 19).replace("T", " ");
 
-const buildPathnameFilter = (spaceVideoIds?: VideoId[]): string => {
+// Fold /embed/<id> into /s/<id> so a video's share and embed hits merge.
+const VIDEO_PATH_SQL = "replaceRegexpOne(pathname, '^/embed/', '/s/')";
+
+export const buildPathnameFilter = (spaceVideoIds?: VideoId[]): string => {
 	if (!spaceVideoIds || spaceVideoIds.length === 0) {
 		return "";
 	}
+	// Embedded players record hits under /embed/<id>.
 	const pathnames = spaceVideoIds
-		.map((id) => `'/s/${escapeLiteral(id)}'`)
+		.flatMap((id) => [
+			`'/s/${escapeLiteral(id)}'`,
+			`'/embed/${escapeLiteral(id)}'`,
+		])
 		.join(", ");
 	return `AND pathname IN (${pathnames})`;
 };
@@ -935,34 +942,34 @@ const queryTopCaps = (
 	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
 	const aggregatedSql = `
 		SELECT
-			pathname,
+			${VIDEO_PATH_SQL} as video_path,
 			uniqMerge(visits) as views
 		FROM analytics_pages_mv
 		WHERE tenant_id = '${escapeLiteral(orgId)}'
 			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			AND startsWith(pathname, '/s/')
+			AND (startsWith(pathname, '/s/') OR startsWith(pathname, '/embed/'))
 			${pathnameFilter}
-		GROUP BY pathname
+		GROUP BY video_path
 		ORDER BY views DESC
 		LIMIT 10
 	`;
 
 	const rawSql = `
 		SELECT
-			coalesce(pathname, '') as pathname,
+			${VIDEO_PATH_SQL} as video_path,
 			uniq(session_id) as views
 		FROM analytics_events
 		WHERE action = 'page_hit'
 			AND tenant_id = '${escapeLiteral(orgId)}'
 			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
+			AND (startsWith(pathname, '/s/') OR startsWith(pathname, '/embed/'))
 			${pathnameFilter}
-		GROUP BY pathname
-		HAVING startsWith(pathname, '/s/')
+		GROUP BY video_path
 		ORDER BY views DESC
 		LIMIT 10
 	`;
 
-	type Row = { pathname: string; views: number };
+	type Row = { video_path: string; views: number };
 	return fallbackIfEmpty(
 		withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
 		withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql)),
@@ -970,7 +977,7 @@ const queryTopCaps = (
 		Effect.map((rows: Row[]) =>
 			rows
 				.map((row: Row) => ({
-					videoId: row.pathname?.split("/s/")[1] ?? row.pathname,
+					videoId: row.video_path?.split("/s/")[1] ?? row.video_path,
 					views: Number(row.views) || 0,
 				}))
 				.filter((row: { videoId: string; views: number }): row is TopCapRow =>

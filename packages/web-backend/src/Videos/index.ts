@@ -33,6 +33,10 @@ const formatDate = (date: Date) => date.toISOString().slice(0, 10);
 const formatDateTime = (date: Date) =>
 	date.toISOString().slice(0, 19).replace("T", " ");
 const buildPathname = (videoId: Video.VideoId) => `/s/${videoId}`;
+const buildEmbedPathname = (videoId: Video.VideoId) => `/embed/${videoId}`;
+// Embedded players record hits under /embed/<id>; fold them into /s/<id> so
+// each video's sessions are merged across both paths.
+const VIDEO_PATH_SQL = "replaceRegexpOne(pathname, '^/embed/', '/s/')";
 const SCREENSHOT_OBJECT_KEY_SUFFIXES = [
 	"screenshot/screen-capture.png",
 	"screenshot/screen-capture.jpg",
@@ -150,7 +154,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 
 				const videosByOrg = new Map<
 					string,
-					Array<{ videoId: Video.VideoId; pathname: string }>
+					Array<{ videoId: Video.VideoId; pathnames: string[] }>
 				>();
 				for (const video of analyticsVideos) {
 					const key = video.orgId;
@@ -161,13 +165,16 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					if (entries) {
 						entries.push({
 							videoId: video.id,
-							pathname: buildPathname(video.id),
+							pathnames: [
+								buildPathname(video.id),
+								buildEmbedPathname(video.id),
+							],
 						});
 					}
 				}
 
 				const runTinybirdQuery = <
-					Row extends { pathname?: string | null; views?: number },
+					Row extends { video_path?: string | null; views?: number },
 				>(
 					sql: string,
 				) =>
@@ -183,7 +190,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					);
 
 				for (const [orgKey, entries] of videosByOrg) {
-					const pathnames = entries.map((entry) => entry.pathname);
+					const pathnames = entries.flatMap((entry) => entry.pathnames);
 					if (pathnames.length === 0) continue;
 
 					const escapedPathnames = pathnames
@@ -195,20 +202,20 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 							: "";
 
 					const aggregateSql = `
-						SELECT pathname, coalesce(uniqMerge(visits), 0) AS views
+						SELECT ${VIDEO_PATH_SQL} AS video_path, coalesce(uniqMerge(visits), 0) AS views
 						FROM analytics_pages_mv
 						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
 							AND date BETWEEN toDate('${formatDate(from)}') AND toDate('${formatDate(now)}')
-						GROUP BY pathname
+						GROUP BY video_path
 					`;
 
 					const rawSql = `
-						SELECT coalesce(pathname, '') AS pathname, coalesce(uniq(session_id), 0) AS views
+						SELECT ${VIDEO_PATH_SQL} AS video_path, coalesce(uniq(session_id), 0) AS views
 						FROM analytics_events
 						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
 							AND action = 'page_hit'
 							AND timestamp BETWEEN toDateTime('${formatDateTime(from)}') AND toDateTime('${formatDateTime(now)}')
-						GROUP BY pathname
+						GROUP BY video_path
 					`;
 
 					const aggregateRows = yield* runTinybirdQuery(aggregateSql);
@@ -218,7 +225,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 							: yield* runTinybirdQuery(rawSql);
 
 					for (const row of rows) {
-						const pathname = row.pathname ?? "";
+						const pathname = row.video_path ?? "";
 						const value = Number(row.views ?? 0);
 						if (!pathname) continue;
 						countsByPathname.set(pathname, Number.isFinite(value) ? value : 0);
