@@ -8,27 +8,29 @@ This fork (`bradykirk/cap-bk`) is based on the upstream Cap repository (`CapSoft
 
 The `self-hosted` branch is the deploy branch: every push builds and publishes `ghcr.io/bradykirk/cap-web:latest` to GHCR (see `.github/workflows/docker-publish.yml`). That image is what the self-hosted deployment runs.
 
-**Last synced with upstream `CapSoftware/Cap`:** 2026-05-29
+**Last synced with upstream `CapSoftware/Cap`:** 2026-10-07 (`d327051c1`)
 
 ## Active Customizations
 
-These changes live only in the `cap-web` image (the web app). Each was re-verified against current upstream during the 2026-05-29 sync.
+These changes live only in the `cap-web` image (the web app). Each was re-verified against current upstream during the 2026-10-07 sync.
 
-### 1. Transcription Workflow Bypass
+### 1. Deepgram Transcription Provider
 
-**File:** `apps/web/lib/transcribe.ts`
+**Files:** `apps/web/lib/deepgram.ts`, `apps/web/lib/transcription-provider.ts`, `apps/web/workflows/transcribe.ts`, `packages/env/server.ts`, plus the caller gates in `apps/web/lib/transcribe.ts`, `apps/web/actions/videos/get-status.ts`, `apps/web/app/s/[videoId]/page.tsx`, `apps/web/workflows/finalize-desktop-recording.ts`
 
-**Description:** Bypassed the Vercel `workflow` package, which has an ArrayBuffer serialization bug in "local world" mode (when `WORKFLOWS_RPC_URL` is not configured). This caused transcription to fail in self-hosted Docker deployments. Replaced the workflow trigger with a direct Deepgram integration using a fire-and-forget async pattern. Upstream's `videoUploads` phase guard (skip while an upload is still in progress) is preserved.
+**Description:** Upstream transcribes only with AssemblyAI (`ASSEMBLY_API_KEY`). This deployment uses Deepgram (`DEEPGRAM_API_KEY`, model `nova-3`). Deepgram runs inside upstream's own transcription workflow: the two AssemblyAI steps branch on `getTranscriptionProvider()`, and `deepgramToEditResult` converts Deepgram words (seconds) to the AssemblyAI word shape (milliseconds). The result goes through the same `createEditTranscript` pipeline, so captions, the encrypted edit transcript, transcript editing, and backfill all work. AssemblyAI wins when both keys are set. Every upstream `ASSEMBLY_API_KEY` transcription gate is replaced with `isTranscriptionConfigured()`. Live transcription stays AssemblyAI-only and skips cleanly without that key.
 
-### 2. AI Generation Workflow Bypass
+**On each sync:** `git grep -n ASSEMBLY_API_KEY -- apps/web` and route any new transcription gate through `isTranscriptionConfigured()`; check that both AssemblyAI steps in `workflows/transcribe.ts` still have the Deepgram branch.
 
-**File:** `apps/web/lib/generate-ai.ts`
+**History:** Earlier syncs bypassed the `workflow` package entirely (fire-and-forget Deepgram and AI code in `lib/transcribe.ts` / `lib/generate-ai.ts`) because of an ArrayBuffer serialization bug in `workflow@4.0.1-beta.42` local world. Upstream now pins `workflow@4.6.0`, so the 2026-10-07 sync removed both bypasses. If transcription or AI generation fails in local world again, restore an in-process path on top of the provider branch rather than reverting it.
 
-**Description:** Same fix as transcription — bypassed the `workflow` package for AI summary generation, moving all generation logic directly into the file with a fire-and-forget pattern.
+### 2. AI Generation Options
 
-**Required Environment Variables:**
-- `GROQ_API_KEY` (preferred — faster and has a free tier)
-- `OPENAI_API_KEY` (fallback if Groq is not set)
+**Files:** `apps/web/lib/ai/provider.ts`, `apps/web/lib/generate-ai.ts`, `apps/web/workflows/generate-ai.ts`, `apps/web/app/api/videos/[videoId]/retry-ai/route.ts`, `apps/web/lib/ai-transcript.ts`
+
+**Description:** The OpenAI provider honours `OPENAI_BASE_URL`. `startAiGeneration` and the AI workflow accept `force` so `retry-ai?force=true` can regenerate a completed video (manual summary/chapter edits stay protected by `setGeneratedAiContent`). Upstream fixed the hallucinated-chapter root cause itself (timestamped prompt + `clampChapters`); `sanitizeChapters` remains only as a render guard on the share and embed pages for chapters stored before that fix. It drops invalid and out-of-range entries but keeps close owner edits.
+
+**Required Environment Variables:** `GROQ_API_KEY` (first in auto-detect) or `OPENAI_API_KEY`, or the upstream `AI_PROVIDER` / `AI_MODEL` / `AI_BASE_URL` settings.
 
 ### 3. Cloudflare / Custom Geo-location Header Fallbacks
 
@@ -45,13 +47,13 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 
 **File:** `apps/web/Dockerfile`
 
-**Description:** Added `apk add --no-cache ffmpeg` to the runner stage. FFmpeg is required for detecting and extracting audio tracks during transcription; without it, videos report "No audio track detected". Pinned the base image to `node:22-alpine` (the known-good version for this deployment) rather than upstream's `node:24-alpine`.
+**Description:** Added `apk add --no-cache ffmpeg` to the runner stage. FFmpeg is required for detecting and extracting audio tracks during transcription; without it, videos report "No audio track detected". The base image follows upstream (`node:24-alpine` with a Bun 1.4.0 build stage); the old `node:22-alpine` pin was dropped in the 2026-10-07 sync.
 
 ### 5. Docker Publish Workflow
 
 **File:** `.github/workflows/docker-publish.yml`
 
-**Description:** GitHub Actions workflow that builds and publishes the Docker image to GHCR on every push to `self-hosted`. This file does not exist upstream.
+**Description:** GitHub Actions workflow that builds and publishes the Docker image to GHCR on every push to `self-hosted`. It runs `bun run typecheck` and the self-hosted unit tests (blocking) before the build; the full test suite is advisory.
 
 ### 6. Folder Color / Rive Race-Condition Fixes
 
@@ -62,7 +64,13 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 
 **Description:** Fixes folder color rendering (direct Rive `src` loading) and a New Folder / Subfolder dialog crash caused by a Rive animation race condition. Upstream has not changed these files, so the fixes are carried forward verbatim.
 
-### 7. Rive Assets Excluded From The Proxy
+### 7. View Tracking And Transcription Loading Timeout
+
+**Files:** `apps/web/lib/track-video-view.ts`, `apps/web/app/s/[videoId]/Share.tsx`, `apps/web/app/embed/[videoId]/_components/EmbedVideo.tsx`
+
+**Description:** The view tracker is shared by the share page and the embed player (upstream tracks only the share page). The share page stops showing the AI loading state after 5 minutes when transcription never starts.
+
+### 8. Rive Assets Excluded From The Proxy
 
 **File:** `apps/web/proxy.ts`
 
@@ -70,7 +78,7 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 
 **On each sync:** verify `rive` is still present in the matcher's negative lookahead, and check whether the file has been renamed again.
 
-### 8. Self-Hosted Rive WASM Must Match The Installed Runtime
+### 9. Self-Hosted Rive WASM Must Match The Installed Runtime
 
 **File:** `apps/web/public/rive/rive.wasm`
 
@@ -79,10 +87,12 @@ These changes live only in the `cap-web` image (the web app). Each was re-verifi
 **On each sync:** re-copy the binary from the resolved package.
 
 ```bash
-cp node_modules/.pnpm/@rive-app+canvas@*/node_modules/@rive-app/canvas/rive.wasm apps/web/public/rive/rive.wasm
+cp "$(dirname "$(cd apps/web && node -p "require.resolve('@rive-app/canvas/package.json', { paths: [require.resolve('@rive-app/react-canvas')] })")")/rive.wasm" apps/web/public/rive/rive.wasm
 ```
 
 ## Deploying
+
+Before the first deploy of the 2026-10-07 sync: back up the database (migrations `0037`–`0049` run at startup and are forward-only), then run the image against a copy of that database with `DEEPGRAM_API_KEY` set and `ASSEMBLY_API_KEY` unset. Record one video and confirm transcription completes, captions show, the transcript editor opens, and the AI summary and chapters appear.
 
 1. Apply database migrations **before** the new image goes live. The app runs Drizzle migrations at startup; they are journal-based, so never apply migration SQL by hand — doing so desyncs `__drizzle_migrations` and every subsequent boot fails with `ER_DUP_KEYNAME` or similar.
 2. Push to `self-hosted`. The workflow typechecks, then builds and publishes `ghcr.io/bradykirk/cap-web:latest`.
@@ -144,7 +154,7 @@ CAP_AWS_ACCESS_KEY=your-key
 CAP_AWS_SECRET_KEY=your-secret
 CAP_AWS_ENDPOINT=http://minio:9000
 
-# Transcription
+# Transcription (Deepgram; ASSEMBLY_API_KEY takes priority if set)
 DEEPGRAM_API_KEY=your-deepgram-key
 
 # AI Generation

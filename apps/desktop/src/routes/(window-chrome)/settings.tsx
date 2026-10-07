@@ -22,7 +22,7 @@ import { CapErrorBoundary } from "~/components/CapErrorBoundary";
 import { SignInButton } from "~/components/SignInButton";
 
 import { authStore, userProfileStore } from "~/store";
-import { trackEvent } from "~/utils/analytics";
+import { resetUser, trackEvent } from "~/utils/analytics";
 import { createSignInMutation } from "~/utils/auth";
 import { commands } from "~/utils/tauri";
 import {
@@ -30,6 +30,7 @@ import {
 	getConfiguredServerUrl,
 	protectedHeaders,
 } from "~/utils/web-api";
+import IconLucideSlidersHorizontal from "~icons/lucide/sliders-horizontal";
 import IconLucideTerminal from "~icons/lucide/terminal";
 import IconLucideUserRound from "~icons/lucide/user-round";
 import IconLucideZap from "~icons/lucide/zap";
@@ -149,6 +150,7 @@ export default function Settings(props: RouteSectionProps) {
 	>(null);
 	const clearLocalAuth = async () => {
 		setAuth(undefined);
+		resetUser();
 		queryClient.removeQueries({ queryKey: ["settings-user-profile"] });
 		await Promise.all([
 			authStore.set(undefined),
@@ -200,6 +202,11 @@ export default function Settings(props: RouteSectionProps) {
 			icon: IconCapSettings,
 		},
 		{
+			href: "quality",
+			name: "Recording quality",
+			icon: IconLucideSlidersHorizontal,
+		},
+		{
 			href: "hotkeys",
 			name: "Shortcuts",
 			icon: IconCapHotkeys,
@@ -236,7 +243,7 @@ export default function Settings(props: RouteSectionProps) {
 		},
 		{
 			href: "license",
-			name: "License",
+			name: "Plan & license",
 			icon: IconLucideGift,
 		},
 		{

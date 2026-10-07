@@ -1,61 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	formatTranscriptWithTimestamps,
-	parseVttWithTimestamps,
-	sanitizeChapters,
-} from "@/lib/ai-transcript";
-
-const SAMPLE_VTT = `WEBVTT
-
-1
-00:00:00.080 --> 00:00:04.320
-Welcome everyone to the dealer update call.
-
-2
-00:01:12.000 --> 00:01:18.500
-Next up is how you update your store information.
-
-3
-00:03:31.250 --> 00:03:39.000
-Thanks for listening, send us your feedback.
-`;
-
-describe("parseVttWithTimestamps", () => {
-	it("keeps the cue start time with each caption line", () => {
-		expect(parseVttWithTimestamps(SAMPLE_VTT)).toEqual([
-			{ start: 0, text: "Welcome everyone to the dealer update call." },
-			{
-				start: 72,
-				text: "Next up is how you update your store information.",
-			},
-			{ start: 211, text: "Thanks for listening, send us your feedback." },
-		]);
-	});
-
-	it("returns nothing for an empty transcript", () => {
-		expect(parseVttWithTimestamps("WEBVTT\n\n")).toEqual([]);
-	});
-});
-
-describe("formatTranscriptWithTimestamps", () => {
-	it("prefixes every line with its timestamp so the model can cite it", () => {
-		const segments = parseVttWithTimestamps(SAMPLE_VTT);
-
-		expect(formatTranscriptWithTimestamps(segments)).toBe(
-			[
-				"[00:00] Welcome everyone to the dealer update call.",
-				"[01:12] Next up is how you update your store information.",
-				"[03:31] Thanks for listening, send us your feedback.",
-			].join("\n"),
-		);
-	});
-
-	it("formats past an hour without wrapping", () => {
-		expect(
-			formatTranscriptWithTimestamps([{ start: 3725, text: "later" }]),
-		).toBe("[62:05] later");
-	});
-});
+import { sanitizeChapters } from "@/lib/ai-transcript";
 
 describe("sanitizeChapters", () => {
 	it("drops chapters that start after the video ends", () => {
@@ -81,21 +25,38 @@ describe("sanitizeChapters", () => {
 		]);
 	});
 
-	it("sorts and drops chapters closer than 30 seconds apart", () => {
+	it("sorts chapters and keeps owner edits that sit close together", () => {
 		expect(
 			sanitizeChapters(
 				[
 					{ title: "Third", start: 200 },
 					{ title: "First", start: 0 },
-					{ title: "Near duplicate", start: 10 },
+					{ title: "Close edit", start: 10.5 },
 					{ title: "Second", start: 100 },
 				],
 				600,
 			),
 		).toEqual([
 			{ title: "First", start: 0 },
+			{ title: "Close edit", start: 10.5 },
 			{ title: "Second", start: 100 },
 			{ title: "Third", start: 200 },
+		]);
+	});
+
+	it("drops chapters that repeat an earlier start time", () => {
+		expect(
+			sanitizeChapters(
+				[
+					{ title: "Intro", start: 0 },
+					{ title: "Duplicate", start: 0 },
+					{ title: "Body", start: 60 },
+				],
+				600,
+			),
+		).toEqual([
+			{ title: "Intro", start: 0 },
+			{ title: "Body", start: 60 },
 		]);
 	});
 

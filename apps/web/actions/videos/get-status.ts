@@ -3,11 +3,11 @@
 import { db } from "@cap/database";
 import { users, videos, videoUploads } from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
-import { serverEnv } from "@cap/env";
 import { provideOptionalAuth, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Exit } from "effect";
+import { isAiConfigured } from "@/lib/ai/provider";
 import {
 	isRetryableDesktopSegmentsFinalizationError,
 	queueDesktopSegmentsFinalization,
@@ -16,6 +16,7 @@ import { startAiGeneration } from "@/lib/generate-ai";
 import * as EffectRuntime from "@/lib/server";
 import { transcribeVideo } from "../../lib/transcribe";
 import { isAiGenerationEnabled } from "../../utils/flags";
+import { isTranscriptionConfigured } from "@/lib/transcription-provider";
 
 type TranscriptionStatus =
 	| "PROCESSING"
@@ -61,7 +62,7 @@ export async function getVideoStatus(
 
 	const metadata: VideoMetadata = (video.metadata as VideoMetadata) || {};
 
-	if (!video.transcriptionStatus && serverEnv().DEEPGRAM_API_KEY) {
+	if (!video.transcriptionStatus && isTranscriptionConfigured()) {
 		const activeUpload = await db()
 			.select({
 				videoId: videoUploads.videoId,
@@ -156,7 +157,7 @@ export async function getVideoStatus(
 		video.transcriptionStatus === "COMPLETE" &&
 		!metadata.aiGenerationStatus &&
 		!metadata.summary &&
-		(serverEnv().GROQ_API_KEY || serverEnv().OPENAI_API_KEY);
+		isAiConfigured();
 
 	if (shouldTriggerAiGeneration) {
 		try {

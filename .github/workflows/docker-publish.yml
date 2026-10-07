@@ -21,11 +21,14 @@ jobs:
       - uses: ./.github/actions/setup-js
 
       - name: Typecheck
-        run: pnpm typecheck
+        run: bun run typecheck
+
+      - name: Test self-hosted customizations
+        run: bun run --cwd apps/web test -- __tests__/unit/ai-transcript.test.ts __tests__/unit/deepgram.test.ts __tests__/unit/transcription-provider.test.ts
 
       - name: Test (advisory until known failures are resolved)
         continue-on-error: true
-        run: pnpm --dir apps/web test
+        run: bun run --cwd apps/web test
 
   build-and-push:
     needs: verify
