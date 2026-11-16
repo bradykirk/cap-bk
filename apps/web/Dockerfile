@@ -22,6 +22,7 @@ FROM base AS runner
 WORKDIR /app
 
 RUN apk add --no-cache ffmpeg
+ENV FFMPEG_PATH=/usr/bin/ffmpeg
 
 RUN addgroup -g 1001 -S nodejs
 RUN adduser -S nextjs -u 1001

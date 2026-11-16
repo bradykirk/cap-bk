@@ -19,11 +19,14 @@ export function getFfmpegPath(): string {
 		return cachedFfmpegPath;
 	}
 
+	// FFMPEG_PATH wins over ffmpeg-static: the static glibc binary cannot resolve
+	// hostnames on the Alpine self-hosted image ("Failed to resolve hostname ...:
+	// System error"), so the Dockerfile points FFMPEG_PATH at the apk ffmpeg.
 	const candidatePaths = [
+		process.env.FFMPEG_PATH,
 		ffmpegStaticPath,
 		resolve(process.cwd(), "node_modules/ffmpeg-static/ffmpeg"),
 		"/var/task/node_modules/ffmpeg-static/ffmpeg",
-		process.env.FFMPEG_PATH,
 		"/opt/homebrew/bin/ffmpeg",
 		"/usr/local/bin/ffmpeg",
 		"/usr/bin/ffmpeg",
